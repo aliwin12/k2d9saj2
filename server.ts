@@ -4,7 +4,12 @@ import { WebSocketServer, WebSocket } from 'ws';
 import { createServer as createViteServer } from 'vite';
 import path from 'path';
 import crypto from 'crypto';
-import { requireAuth, AuthRequest } from './src/middleware/auth.ts';
+import {
+  requireAuth,
+  AuthRequest,
+  createSignedClickChatToken,
+  verifySignedClickChatToken,
+} from './src/middleware/auth.ts';
 import { adminAuth } from './src/lib/firebase-admin.ts';
 import {
   createBotInDb,
@@ -31,6 +36,29 @@ function sha256(data: string): string {
 
 async function startServer() {
   const app = express();
+  app.use((req, res, next) => {
+    const origin = req.headers.origin || '';
+    if (
+      origin === 'https://webclickchat.vercel.app' ||
+      origin.endsWith('.vercel.app') ||
+      origin.endsWith('.run.app') ||
+      origin.startsWith('http://localhost')
+    ) {
+      res.setHeader('Access-Control-Allow-Origin', origin);
+      res.setHeader(
+        'Access-Control-Allow-Methods',
+        'GET,POST,PATCH,DELETE,OPTIONS'
+      );
+      res.setHeader(
+        'Access-Control-Allow-Headers',
+        'Content-Type,Authorization'
+      );
+    }
+    if (req.method === 'OPTIONS') {
+      return res.sendStatus(204);
+    }
+    next();
+  });
   app.use(express.json({ limit: '25mb' }));
 
   const httpServer = createServer(app);
@@ -140,6 +168,69 @@ async function startServer() {
   // AUTHENTICATED REST API ROUTES (Secured by Firebase ID Token + PostgreSQL)
   // ============================================================================
 
+  // Direct Email & Password Account Registration / Login (Works on any domain including Vercel without Firebase Console domain limits)
+  app.post('/api/auth/account', async (req, res) => {
+    try {
+      const { mode, email, password, displayName, deviceAgent } = req.body || {};
+      const cleanEmail = String(email || '').trim().toLowerCase();
+      const cleanPassword = String(password || '');
+
+      if (!cleanEmail || !cleanEmail.includes('@') || cleanPassword.length < 6) {
+        return res.status(400).json({
+          error: 'Укажите корректный Email и пароль (минимум 6 символов)',
+        });
+      }
+
+      const expectedUid = `u_${sha256(`clickchat-cred:${cleanEmail}:${cleanPassword}`).slice(0, 20)}`;
+      const stateBefore = await getFullApplicationState();
+      const existingByEmail = stateBefore.users.find(
+        (u) => String(u.email || '').toLowerCase() === cleanEmail
+      );
+
+      if (mode === 'register') {
+        if (existingByEmail && existingByEmail.id !== expectedUid) {
+          return res.status(409).json({
+            error: 'Этот Email уже зарегистрирован. Переключитесь на вкладку «Вход».',
+          });
+        }
+      } else {
+        if (existingByEmail && existingByEmail.id !== expectedUid) {
+          return res.status(401).json({
+            error: 'Неверный пароль для указанного Email.',
+          });
+        }
+      }
+
+      const resolvedName =
+        String(displayName || '').trim() ||
+        existingByEmail?.displayName ||
+        cleanEmail.split('@')[0];
+
+      const currentUser = await getOrCreateAuthenticatedUser({
+        uid: expectedUid,
+        email: cleanEmail,
+        displayName: resolvedName,
+        avatarUrl: existingByEmail?.avatarUrl || '',
+        deviceAgent: deviceAgent || 'ClickChat Web Session',
+      });
+
+      const token = createSignedClickChatToken({
+        uid: currentUser.id,
+        email: currentUser.email || cleanEmail,
+        name: currentUser.displayName,
+        picture: currentUser.avatarUrl || '',
+      });
+
+      const state = await getFullApplicationState();
+      broadcast('user:created', currentUser);
+      return res.json({ token, currentUser, state });
+    } catch (error: any) {
+      return res.status(500).json({
+        error: error.message || 'Ошибка авторизации аккаунта',
+      });
+    }
+  });
+
   // Synchronize authenticated user account with PostgreSQL and return full workspace state
   app.post('/api/auth/session', requireAuth, async (req: AuthRequest, res) => {
     try {
@@ -153,9 +244,15 @@ async function startServer() {
         deviceAgent,
       });
 
+      const signedToken = createSignedClickChatToken({
+        uid: currentUser.id,
+        email: currentUser.email || decoded.email || `${decoded.uid}@clickchat.user`,
+        name: currentUser.displayName,
+        picture: currentUser.avatarUrl || '',
+      });
       const state = await getFullApplicationState();
       broadcast('user:created', currentUser);
-      res.json({ currentUser, state });
+      res.json({ currentUser, state, signedToken });
     } catch (error: any) {
       console.error('Failed to initialize authenticated session:', error);
       res
@@ -552,14 +649,19 @@ async function startServer() {
         const data = JSON.parse(rawBuffer.toString());
         const { event, payload, token } = data;
 
-        // Verify Firebase token if provided on socket messages
+        // Verify signed ClickChat token or Firebase token if provided on socket messages
         let verifiedUid: string | null = null;
         if (token) {
-          try {
-            const decoded = await adminAuth.verifyIdToken(token);
-            verifiedUid = decoded.uid;
-          } catch {
-            // Ignore expired token on non-critical WS relay
+          const signed = verifySignedClickChatToken(token);
+          if (signed) {
+            verifiedUid = signed.uid;
+          } else {
+            try {
+              const decoded = await adminAuth.verifyIdToken(token);
+              verifiedUid = decoded.uid;
+            } catch {
+              // Ignore expired token on non-critical WS relay
+            }
           }
         }
 

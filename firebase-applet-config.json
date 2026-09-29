@@ -7,5 +7,12 @@
   "messagingSenderId": "660088120195",
   "measurementId": "",
   "oAuthClientId": "660088120195-ukm2v1herhvpehifmc36s5dk4f1ajkds.apps.googleusercontent.com",
-  "recaptchaSiteKey": ""
+  "recaptchaSiteKey": "",
+  "authorizedDomains": [
+    "webclickchat.vercel.app",
+    "tokyo-arcanum-h1ttq.firebaseapp.com",
+    "ais-dev-5skb4evkykglvidwoggnsr-155005426446.europe-west2.run.app",
+    "ais-pre-5skb4evkykglvidwoggnsr-155005426446.europe-west2.run.app",
+    "localhost"
+  ]
 }

@@ -95,7 +95,79 @@ const memoryStore: {
   bots: [],
 };
 
+const TOKEN_SECRET =
+  process.env.CLICKCHAT_JWT_SECRET ||
+  process.env.SQL_PASSWORD ||
+  'clickchat-production-hmac-sha256-secret-v1';
+
+function createSignedClickChatToken(payload: {
+  uid: string;
+  email: string;
+  name: string;
+  picture?: string;
+}): string {
+  const data = {
+    uid: payload.uid,
+    email: payload.email,
+    name: payload.name,
+    picture: payload.picture || '',
+    iat: Date.now(),
+  };
+  const base64Payload = Buffer.from(JSON.stringify(data), 'utf8').toString(
+    'base64url'
+  );
+  const signature = crypto
+    .createHmac('sha256', TOKEN_SECRET)
+    .update(base64Payload)
+    .digest('base64url');
+  return `cc_jwt_${base64Payload}.${signature}`;
+}
+
+function verifySignedClickChatToken(token: string) {
+  if (!token.startsWith('cc_jwt_')) return null;
+  try {
+    const raw = token.slice('cc_jwt_'.length);
+    const [base64Payload, signature] = raw.split('.');
+    if (!base64Payload || !signature) return null;
+    const expectedSig = crypto
+      .createHmac('sha256', TOKEN_SECRET)
+      .update(base64Payload)
+      .digest('base64url');
+    if (signature !== expectedSig) return null;
+    const parsed = JSON.parse(
+      Buffer.from(base64Payload, 'base64url').toString('utf8')
+    );
+    if (!parsed || !parsed.uid || !parsed.email) return null;
+    return parsed;
+  } catch {
+    return null;
+  }
+}
+
 const app = express();
+app.use((req, res, next) => {
+  const origin = req.headers.origin || '';
+  if (
+    origin === 'https://webclickchat.vercel.app' ||
+    origin.endsWith('.vercel.app') ||
+    origin.endsWith('.run.app') ||
+    origin.startsWith('http://localhost')
+  ) {
+    res.setHeader('Access-Control-Allow-Origin', origin);
+    res.setHeader(
+      'Access-Control-Allow-Methods',
+      'GET,POST,PATCH,DELETE,OPTIONS'
+    );
+    res.setHeader(
+      'Access-Control-Allow-Headers',
+      'Content-Type,Authorization'
+    );
+  }
+  if (req.method === 'OPTIONS') {
+    return res.sendStatus(204);
+  }
+  next();
+});
 app.use(express.json({ limit: '25mb' }));
 
 async function verifyRequestUser(req: express.Request) {
@@ -104,6 +176,10 @@ async function verifyRequestUser(req: express.Request) {
     throw new Error('Missing Authorization Bearer token');
   }
   const token = authHeader.split('Bearer ')[1].trim();
+  const signed = verifySignedClickChatToken(token);
+  if (signed) {
+    return signed;
+  }
   return await adminAuth.verifyIdToken(token);
 }
 
@@ -113,6 +189,99 @@ app.get('/api/health', (_req, res) => {
     engine: 'ClickChat Serverless API',
     database: isPostgresConfigured ? 'PostgreSQL' : 'Serverless Store',
   });
+});
+
+app.post('/api/auth/account', async (req, res) => {
+  try {
+    const { mode, email, password, displayName, deviceAgent } = req.body || {};
+    const cleanEmail = String(email || '').trim().toLowerCase();
+    const cleanPassword = String(password || '');
+
+    if (!cleanEmail || !cleanEmail.includes('@') || cleanPassword.length < 6) {
+      return res.status(400).json({
+        error: 'Укажите корректный Email и пароль (минимум 6 символов)',
+      });
+    }
+
+    const expectedUid = `u_${sha256(`clickchat-cred:${cleanEmail}:${cleanPassword}`).slice(0, 20)}`;
+    const existingByEmail = memoryStore.users.find(
+      (u) => String(u.email || '').toLowerCase() === cleanEmail
+    );
+
+    if (mode === 'register') {
+      if (existingByEmail && existingByEmail.id !== expectedUid) {
+        return res.status(409).json({
+          error: 'Этот Email уже зарегистрирован. Переключитесь на вкладку «Вход».',
+        });
+      }
+    } else {
+      if (existingByEmail && existingByEmail.id !== expectedUid) {
+        return res.status(401).json({
+          error: 'Неверный пароль для указанного Email.',
+        });
+      }
+    }
+
+    const emailPrefix = cleanEmail
+      .split('@')[0]
+      .toLowerCase()
+      .replace(/[^a-z0-9_]/g, '_');
+    const handle = `${emailPrefix}_${expectedUid.slice(2, 6).toLowerCase()}`;
+    const resolvedName =
+      String(displayName || '').trim() ||
+      existingByEmail?.displayName ||
+      cleanEmail.split('@')[0];
+    const keyHex = sha256(`clickchat-identity:${expectedUid}`);
+    const keyFp = formatFp(keyHex);
+    const syncCode = generateSyncCode(`sync:${expectedUid}`);
+
+    let currentUser = memoryStore.users.find((u) => u.id === expectedUid);
+    if (!currentUser) {
+      currentUser = {
+        id: expectedUid,
+        uid: expectedUid,
+        email: cleanEmail,
+        handle,
+        displayName: resolvedName,
+        bio: '',
+        avatarUrl: '',
+        publicKeyHex: keyHex,
+        publicKeyFingerprint: keyFp,
+        status: 'online',
+        createdAt: new Date().toISOString(),
+        syncCode,
+      };
+      memoryStore.users.push(currentUser);
+    }
+
+    const primaryDeviceId = `dev_${expectedUid.slice(0, 10)}_primary`;
+    if (!memoryStore.devices.some((d) => d.id === primaryDeviceId)) {
+      memoryStore.devices.push({
+        id: primaryDeviceId,
+        userId: expectedUid,
+        deviceName: deviceAgent || 'ClickChat Web Session',
+        platform: 'Web Crypto E2EE',
+        lastActiveAt: new Date().toISOString(),
+        keyFingerprint: keyFp.slice(0, 19),
+        syncState: 'synced',
+      });
+    }
+
+    const token = createSignedClickChatToken({
+      uid: currentUser.id,
+      email: currentUser.email,
+      name: currentUser.displayName,
+      picture: currentUser.avatarUrl || '',
+    });
+
+    return res.json({
+      token,
+      currentUser,
+      state: memoryStore,
+    });
+  } catch (error: any) {
+    return res.status(500).json({ error: error.message || 'Auth error' });
+  }
 });
 
 app.post('/api/auth/session', async (req, res) => {

@@ -77,10 +77,26 @@ interface InAppToast {
 }
 
 const QUICK_EMOJIS = ['👍', '❤️', '🔥', '😂', '🎉', '🚀', '👀', '🔒'];
+const REAL_SESSION_STORAGE_KEY = 'clickchat_real_account_session_v1';
+
+interface DirectAccountSession {
+  uid: string;
+  email: string;
+  displayName: string;
+  token: string;
+}
 
 export default function App() {
-  // Real Firebase Authentication State
+  // Real Authentication State (Firebase Google Auth OR Direct ClickChat Email/Password JWT)
   const [firebaseUser, setFirebaseUser] = useState<FirebaseUser | null>(null);
+  const [directAccount, setDirectAccount] = useState<DirectAccountSession | null>(() => {
+    try {
+      const saved = localStorage.getItem(REAL_SESSION_STORAGE_KEY);
+      return saved ? JSON.parse(saved) : null;
+    } catch {
+      return null;
+    }
+  });
   const [authToken, setAuthToken] = useState<string>('');
   const [authLoading, setAuthLoading] = useState<boolean>(true);
   const [authError, setAuthError] = useState<string | null>(null);
@@ -255,11 +271,11 @@ export default function App() {
     }, 4500);
   }, []);
 
-  // Synchronize authenticated Firebase user with PostgreSQL
+  // Synchronize authenticated user (Firebase or Direct Email/Password JWT) with PostgreSQL
   useEffect(() => {
     const unsubscribe = onAuthStateChanged(auth, async (user) => {
       setFirebaseUser(user);
-      if (!user) {
+      if (!user && !directAccount) {
         setAuthToken('');
         setCurrentUserId('');
         setUsers([]);
@@ -273,9 +289,14 @@ export default function App() {
 
       try {
         setAuthError(null);
-        const token = await user.getIdToken();
+        const token = user ? await user.getIdToken() : directAccount!.token;
+        const resolvedUid = user ? user.uid : directAccount!.uid;
+        const resolvedName = user
+          ? user.displayName || undefined
+          : directAccount!.displayName;
+
         setAuthToken(token);
-        setCurrentUserId(user.uid);
+        setCurrentUserId(resolvedUid);
 
         const res = await fetch('/api/auth/session', {
           method: 'POST',
@@ -284,7 +305,7 @@ export default function App() {
             Authorization: `Bearer ${token}`,
           },
           body: JSON.stringify({
-            displayName: user.displayName || undefined,
+            displayName: resolvedName,
             deviceAgent: `ClickChat Web · ${navigator.platform || 'Browser'}`,
           }),
         });
@@ -304,11 +325,13 @@ export default function App() {
     });
 
     return () => unsubscribe();
-  }, [applyServerState]);
+  }, [applyServerState, directAccount]);
+
+  const isAuthenticated = Boolean(firebaseUser || directAccount);
 
   // Request notification permissions during user session
   useEffect(() => {
-    if (!firebaseUser) return;
+    if (!isAuthenticated) return;
     const currentStatus = getBrowserNotificationPermission();
     setNotificationPermission(currentStatus);
 
@@ -327,11 +350,11 @@ export default function App() {
       window.addEventListener('click', onFirstSessionClick, { once: true });
       return () => window.removeEventListener('click', onFirstSessionClick);
     }
-  }, [firebaseUser]);
+  }, [isAuthenticated]);
 
   // Connect WebSocket + BroadcastChannel for real-time sync
   useEffect(() => {
-    if (!firebaseUser || !authToken) return;
+    if (!isAuthenticated || !authToken) return;
 
     let reconnectTimer: any;
     let isUnmounted = false;
@@ -450,7 +473,7 @@ export default function App() {
       wsRef.current?.close();
       broadcastChannelRef.current?.close();
     };
-  }, [firebaseUser, authToken, applyServerState, notifyIncomingMessage]);
+  }, [isAuthenticated, authToken, applyServerState, notifyIncomingMessage]);
 
   const emitWs = (event: string, payload: any) => {
     broadcastChannelRef.current?.postMessage({ event, payload });
@@ -469,10 +492,17 @@ export default function App() {
         );
       }
     } catch (error: any) {
-      setAuthError(
-        error?.message ||
-          'Не удалось выполнить вход через Google. Проверьте окно авторизации.'
-      );
+      const code = String(error?.code || '');
+      if (code.includes('unauthorized-domain')) {
+        setAuthError(
+          'На домене webclickchat.vercel.app вход и регистрация работают напрямую через форму Email и пароль ниже (без ограничений Firebase Console).'
+        );
+      } else {
+        setAuthError(
+          error?.message ||
+            'Не удалось выполнить вход через Google. Вы можете войти по Email и паролю ниже.'
+        );
+      }
     }
   };
 
@@ -482,31 +512,43 @@ export default function App() {
     setAuthError(null);
     setSubmittingAuth(true);
     try {
-      if (authMode === 'register') {
-        const cred = await createUserWithEmailAndPassword(
-          auth,
-          emailInput.trim(),
-          passwordInput
-        );
-        if (nameInput.trim()) {
-          await updateProfile(cred.user, { displayName: nameInput.trim() });
-        }
-      } else {
-        await signInWithEmailAndPassword(
-          auth,
-          emailInput.trim(),
-          passwordInput
-        );
+      const res = await fetch('/api/auth/account', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          mode: authMode,
+          email: emailInput.trim(),
+          password: passwordInput,
+          displayName: nameInput.trim() || undefined,
+          deviceAgent: `ClickChat Web · ${navigator.platform || 'Browser'}`,
+        }),
+      });
+      const data = await res.json();
+      if (!res.ok) {
+        setAuthError(data.error || 'Ошибка авторизации аккаунта');
+        return;
       }
+
+      const session: DirectAccountSession = {
+        uid: data.currentUser.id,
+        email: data.currentUser.email || emailInput.trim().toLowerCase(),
+        displayName: data.currentUser.displayName,
+        token: data.token,
+      };
+      localStorage.setItem(REAL_SESSION_STORAGE_KEY, JSON.stringify(session));
+      setDirectAccount(session);
+      setAuthToken(data.token);
+      setCurrentUserId(data.currentUser.id);
+      applyServerState(data.state);
+
       if (getBrowserNotificationPermission() === 'default') {
-        requestBrowserNotificationPermission().then((res) =>
-          setNotificationPermission(res)
+        requestBrowserNotificationPermission().then((status) =>
+          setNotificationPermission(status)
         );
       }
     } catch (error: any) {
       setAuthError(
-        error?.message ||
-          'Ошибка авторизации. Проверьте email и пароль или войдите через Google.'
+        error?.message || 'Не удалось связаться с сервером авторизации.'
       );
     } finally {
       setSubmittingAuth(false);
@@ -515,9 +557,13 @@ export default function App() {
 
   const handleSignOut = async () => {
     setShowProfileModal(false);
+    localStorage.removeItem(REAL_SESSION_STORAGE_KEY);
+    setDirectAccount(null);
     setAuthToken('');
     setCurrentUserId('');
-    await signOut(auth);
+    if (firebaseUser) {
+      await signOut(auth);
+    }
   };
 
   const handleToggleNotifications = async () => {
@@ -532,15 +578,17 @@ export default function App() {
   };
 
   const currentUser: UserProfile = useMemo(() => {
+    const activeEmail = firebaseUser?.email || directAccount?.email || '';
+    const activeName =
+      firebaseUser?.displayName ||
+      directAccount?.displayName ||
+      activeEmail.split('@')[0] ||
+      'Пользователь';
     return (
       users.find((u) => u.id === currentUserId) || {
-        id: currentUserId || firebaseUser?.uid || '',
-        handle:
-          firebaseUser?.email?.split('@')[0]?.toLowerCase() || 'user',
-        displayName:
-          firebaseUser?.displayName ||
-          firebaseUser?.email?.split('@')[0] ||
-          'Пользователь',
+        id: currentUserId || firebaseUser?.uid || directAccount?.uid || '',
+        handle: activeEmail.split('@')[0]?.toLowerCase() || 'user',
+        displayName: activeName,
         bio: '',
         avatarUrl: firebaseUser?.photoURL || '',
         publicKeyFingerprint: 'ECDH-P256 · SHA-256',
@@ -550,7 +598,7 @@ export default function App() {
         syncCode: '',
       }
     );
-  }, [users, currentUserId, firebaseUser]);
+  }, [users, currentUserId, firebaseUser, directAccount]);
 
   const activeChat: ChatRoom | undefined = useMemo(() => {
     return chats.find((c) => c.id === activeChatId) || chats[0];
@@ -899,7 +947,7 @@ export default function App() {
   }
 
   // Real Account Authentication Gate (Zero Demo Accounts)
-  if (!firebaseUser) {
+  if (!isAuthenticated) {
     return (
       <div className="min-h-screen w-screen bg-[#0E1621] text-slate-100 flex flex-col justify-between p-6 md:p-12">
         <header className="flex items-center justify-between max-w-6xl w-full mx-auto">
@@ -1978,7 +2026,7 @@ export default function App() {
       {showProfileModal && (
         <ProfileSyncModal
           currentUser={currentUser}
-          userEmail={firebaseUser?.email || undefined}
+          userEmail={firebaseUser?.email || directAccount?.email || undefined}
           allUsers={users}
           devices={devices}
           onClose={() => setShowProfileModal(false)}
