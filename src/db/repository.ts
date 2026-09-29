@@ -296,6 +296,8 @@ export async function updateUserProfileInDb(
     displayName?: string;
     handle?: string;
     bio?: string;
+    avatarUrl?: string;
+    accentColor?: string;
     status?: string;
     publicKeyHex?: string;
     publicKeyFingerprint?: string;
@@ -308,6 +310,8 @@ export async function updateUserProfileInDb(
     if (patch.handle)
       u.handle = patch.handle.replace(/^@/, '').trim().toLowerCase();
     if (patch.bio !== undefined) u.bio = patch.bio;
+    if (patch.avatarUrl !== undefined) u.avatarUrl = patch.avatarUrl;
+    if (patch.accentColor !== undefined) u.accentColor = patch.accentColor;
     if (patch.status) u.status = patch.status;
     if (patch.publicKeyHex) u.publicKeyHex = patch.publicKeyHex;
     if (patch.publicKeyFingerprint)
@@ -328,6 +332,7 @@ export async function updateUserProfileInDb(
           ? patch.handle.replace(/^@/, '').trim().toLowerCase()
           : current.handle,
         bio: patch.bio ?? current.bio,
+        avatarUrl: patch.avatarUrl ?? current.avatarUrl,
         status: patch.status ?? current.status,
         publicKeyHex: patch.publicKeyHex ?? current.publicKeyHex,
         publicKeyFingerprint:
@@ -336,7 +341,11 @@ export async function updateUserProfileInDb(
       .where(eq(users.uid, uid))
       .returning();
 
-    return updatedRows[0] ? mapUserRow(updatedRows[0]) : null;
+    const mapped = updatedRows[0] ? mapUserRow(updatedRows[0]) : null;
+    if (mapped && patch.accentColor) {
+      (mapped as any).accentColor = patch.accentColor;
+    }
+    return mapped;
   } catch {
     const u = memoryStore.users.find((item) => item.id === uid);
     if (!u) return null;
@@ -346,34 +355,65 @@ export async function updateUserProfileInDb(
 }
 
 export async function insertMessageInDb(msg: any) {
-  if (!memoryStore.messages.some((m) => m.id === msg.id)) {
-    memoryStore.messages.push(msg);
+  const enrichedMsg = {
+    ...msg,
+    readBy: Array.isArray(msg.readBy)
+      ? msg.readBy
+      : msg.senderId
+      ? [msg.senderId]
+      : [],
+  };
+  if (!memoryStore.messages.some((m) => m.id === enrichedMsg.id)) {
+    memoryStore.messages.push(enrichedMsg);
   }
-  if (!isPostgresConfigured) return msg;
+  if (!isPostgresConfigured) return enrichedMsg;
 
   try {
     await db
       .insert(messages)
       .values({
-        id: msg.id,
-        chatId: msg.chatId,
-        senderId: msg.senderId,
-        senderName: msg.senderName,
-        senderHandle: msg.senderHandle,
-        isBot: Boolean(msg.isBot),
-        text: msg.text,
-        createdAt: msg.createdAt || new Date().toISOString(),
-        replyToId: msg.replyToId || null,
-        attachmentJson: msg.attachment ? JSON.stringify(msg.attachment) : null,
-        e2eeJson: JSON.stringify(msg.e2ee),
-        views: msg.views ?? null,
-        reactionsJson: JSON.stringify(msg.reactions || []),
+        id: enrichedMsg.id,
+        chatId: enrichedMsg.chatId,
+        senderId: enrichedMsg.senderId,
+        senderName: enrichedMsg.senderName,
+        senderHandle: enrichedMsg.senderHandle,
+        isBot: Boolean(enrichedMsg.isBot),
+        text: enrichedMsg.text,
+        createdAt: enrichedMsg.createdAt || new Date().toISOString(),
+        replyToId: enrichedMsg.replyToId || null,
+        attachmentJson: enrichedMsg.attachment
+          ? JSON.stringify(enrichedMsg.attachment)
+          : null,
+        e2eeJson: JSON.stringify(enrichedMsg.e2ee),
+        views: enrichedMsg.views ?? null,
+        reactionsJson: JSON.stringify(enrichedMsg.reactions || []),
       })
       .onConflictDoNothing();
-    return msg;
+    return enrichedMsg;
   } catch {
-    return msg;
+    return enrichedMsg;
   }
+}
+
+export async function markChatMessagesReadInDb(
+  chatId: string,
+  userId: string
+) {
+  const updatedMessages: any[] = [];
+  memoryStore.messages.forEach((m) => {
+    if (m.chatId === chatId) {
+      const currentReadBy: string[] = Array.isArray(m.readBy)
+        ? m.readBy
+        : m.senderId
+        ? [m.senderId]
+        : [];
+      if (!currentReadBy.includes(userId)) {
+        m.readBy = [...currentReadBy, userId];
+        updatedMessages.push(m);
+      }
+    }
+  });
+  return updatedMessages;
 }
 
 export async function toggleReactionInDb(

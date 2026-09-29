@@ -20,6 +20,7 @@ import {
   getFullApplicationState,
   getOrCreateAuthenticatedUser,
   insertMessageInDb,
+  markChatMessagesReadInDb,
   registerDeviceBySyncCodeInDb,
   revokeDeviceInDb,
   rotateChatKeyInDb,
@@ -384,6 +385,19 @@ async function startServer() {
       return res.status(201).json(msg);
     } catch (error: any) {
       return res.status(500).json({ error: error.message || 'Failed to send message' });
+    }
+  });
+
+  // Mark messages in a chat as read by the authenticated user
+  app.post('/api/chats/:chatId/read', requireAuth, async (req: AuthRequest, res) => {
+    try {
+      const uid = req.user!.uid;
+      const chatId = req.params.chatId;
+      await markChatMessagesReadInDb(chatId, uid);
+      broadcast('message:read', { chatId, userId: uid });
+      return res.json({ ok: true, chatId, userId: uid });
+    } catch (error: any) {
+      return res.status(500).json({ error: error.message || 'Failed to mark read' });
     }
   });
 
@@ -809,6 +823,15 @@ async function startServer() {
           case 'call:signal': {
             const sig = recordCallSignal(payload);
             broadcast('call:signal', sig, ws);
+            break;
+          }
+
+          case 'message:read': {
+            const { chatId, userId } = payload || {};
+            const readerId = verifiedUid || userId;
+            if (!chatId || !readerId) break;
+            await markChatMessagesReadInDb(chatId, readerId);
+            broadcast('message:read', { chatId, userId: readerId });
             break;
           }
         }

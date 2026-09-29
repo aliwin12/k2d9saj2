@@ -18,6 +18,7 @@ import {
   Bell,
   BellOff,
   BellRing,
+  Check,
   CheckCheck,
   Smile,
   Bot,
@@ -29,6 +30,7 @@ import {
   Mic,
   Square,
   Trash2,
+  Settings,
 } from 'lucide-react';
 import {
   onAuthStateChanged,
@@ -166,6 +168,7 @@ export default function App() {
   const [incomingCallSignal, setIncomingCallSignal] = useState<any | null>(
     null
   );
+  const [incomingSignalsQueue, setIncomingSignalsQueue] = useState<any[]>([]);
 
   // Decrypted cache for messages verified via Web Crypto API
   const [decryptedMap, setDecryptedMap] = useState<Record<string, string>>({});
@@ -191,6 +194,8 @@ export default function App() {
   const chatsRef = useRef<ChatRoom[]>(chats);
   const notificationsEnabledRef = useRef<boolean>(notificationsEnabled);
   const processedSignalIdsRef = useRef<Set<string>>(new Set());
+  const notifiedMessageIdsRef = useRef<Set<string>>(new Set());
+  const initialMessagesLoadedRef = useRef<boolean>(false);
 
   useEffect(() => {
     currentUserIdRef.current = currentUserId;
@@ -222,15 +227,6 @@ export default function App() {
   useEffect(() => {
     notificationsEnabledRef.current = notificationsEnabled;
   }, [notificationsEnabled]);
-
-  const applyServerState = useCallback((data: any) => {
-    if (!data) return;
-    if (Array.isArray(data.users)) setUsers(data.users);
-    if (Array.isArray(data.devices)) setDevices(data.devices);
-    if (Array.isArray(data.chats)) setChats(data.chats);
-    if (Array.isArray(data.messages)) setMessages(data.messages);
-    if (Array.isArray(data.bots)) setBots(data.bots);
-  }, []);
 
   // Request Browser Notification Permission during user session
   const handleRequestNotificationPermission = useCallback(async () => {
@@ -302,6 +298,44 @@ export default function App() {
       setActiveToasts((prev) => prev.filter((t) => t.id !== toastId));
     }, 4500);
   }, []);
+
+  const applyServerState = useCallback(
+    (data: any, notifyNew?: boolean) => {
+      if (!data) return;
+      if (Array.isArray(data.users)) setUsers(data.users);
+      if (Array.isArray(data.devices)) setDevices(data.devices);
+      if (Array.isArray(data.chats)) setChats(data.chats);
+      if (Array.isArray(data.messages)) {
+        if (!initialMessagesLoadedRef.current) {
+          data.messages.forEach((m: Message) => {
+            notifiedMessageIdsRef.current.add(m.id);
+          });
+          initialMessagesLoadedRef.current = true;
+        } else if (notifyNew) {
+          data.messages.forEach((m: Message) => {
+            if (!notifiedMessageIdsRef.current.has(m.id)) {
+              notifiedMessageIdsRef.current.add(m.id);
+              if (m.senderId && m.senderId !== currentUserIdRef.current) {
+                const targetChat = (data.chats || chatsRef.current).find(
+                  (c: ChatRoom) => c.id === m.chatId
+                );
+                const isMember =
+                  targetChat &&
+                  (targetChat.memberIds?.includes(currentUserIdRef.current) ||
+                    targetChat.adminIds?.includes(currentUserIdRef.current));
+                if (isMember) {
+                  notifyIncomingMessage(m);
+                }
+              }
+            }
+          });
+        }
+        setMessages(data.messages);
+      }
+      if (Array.isArray(data.bots)) setBots(data.bots);
+    },
+    [notifyIncomingMessage]
+  );
 
   // Synchronize authenticated user (Firebase or Direct Email/Password JWT) with PostgreSQL
   useEffect(() => {
@@ -397,18 +431,27 @@ export default function App() {
           applyServerState(payload);
           break;
         case 'message:created': {
-          let isNewMessage = false;
+          const alreadyNotified = notifiedMessageIdsRef.current.has(payload.id);
+          notifiedMessageIdsRef.current.add(payload.id);
           setMessages((prev) => {
             if (prev.some((m) => m.id === payload.id)) return prev;
-            isNewMessage = true;
             return [...prev, payload];
           });
           if (
-            isNewMessage &&
+            !alreadyNotified &&
             payload.senderId &&
             payload.senderId !== currentUserIdRef.current
           ) {
-            notifyIncomingMessage(payload);
+            const targetChat = chatsRef.current.find(
+              (c) => c.id === payload.chatId
+            );
+            const isMember =
+              !targetChat ||
+              targetChat.memberIds?.includes(currentUserIdRef.current) ||
+              targetChat.adminIds?.includes(currentUserIdRef.current);
+            if (isMember) {
+              notifyIncomingMessage(payload);
+            }
           }
           break;
         }
@@ -417,6 +460,23 @@ export default function App() {
             prev.map((m) => (m.id === payload.id ? payload : m))
           );
           break;
+        case 'message:read': {
+          const { chatId, userId } = payload || {};
+          if (!chatId || !userId) break;
+          setMessages((prev) =>
+            prev.map((m) => {
+              if (m.chatId !== chatId) return m;
+              const currentReadBy = Array.isArray(m.readBy)
+                ? m.readBy
+                : m.senderId
+                ? [m.senderId]
+                : [];
+              if (currentReadBy.includes(userId)) return m;
+              return { ...m, readBy: [...currentReadBy, userId] };
+            })
+          );
+          break;
+        }
         case 'chat:created':
           setChats((prev) =>
             prev.some((c) => c.id === payload.id) ? prev : [payload, ...prev]
@@ -472,6 +532,7 @@ export default function App() {
           if (!isMember) break;
 
           if (payload.type === 'call-invite') {
+            setIncomingSignalsQueue([]);
             setCallState({
               active: true,
               callId: payload.callId,
@@ -487,7 +548,18 @@ export default function App() {
               isScreenSharing: false,
               remotePeerConnected: false,
               encryptionSAS: payload.encryptionSAS || 'CALL',
+              minimized: false,
             });
+            if (notificationsEnabledRef.current) {
+              triggerBrowserNotification({
+                title: `Входящий звонок от ${payload.senderName || 'Собеседника'}`,
+                body:
+                  payload.mode === 'video'
+                    ? 'Видеозвонок в ClickChat'
+                    : 'Аудиозвонок в ClickChat',
+                tag: `clickchat-call-${payload.callId}`,
+              });
+            }
           } else if (payload.type === 'call-accept') {
             setCallState((prev) =>
               prev && prev.chatId === payload.chatId
@@ -500,6 +572,7 @@ export default function App() {
                 : prev
             );
             setIncomingCallSignal(payload);
+            setIncomingSignalsQueue((prev) => [...prev.slice(-30), payload]);
           } else if (
             payload.type === 'call-reject' ||
             payload.type === 'call-end' ||
@@ -509,8 +582,10 @@ export default function App() {
               prev && prev.chatId === payload.chatId ? null : prev
             );
             setIncomingCallSignal(payload);
+            setIncomingSignalsQueue([]);
           } else {
             setIncomingCallSignal(payload);
+            setIncomingSignalsQueue((prev) => [...prev.slice(-30), payload]);
           }
           break;
         }
@@ -563,7 +638,7 @@ export default function App() {
         });
         if (!res.ok) return;
         const data = await res.json();
-        applyServerState(data);
+        applyServerState(data, true);
         if (Array.isArray(data.callSignals)) {
           data.callSignals.forEach((sig: any) => {
             handleRealtimeEvent('call:signal', sig);
@@ -794,6 +869,45 @@ export default function App() {
       setDecryptedMap((prev) => ({ ...prev, [m.id]: plaintext }));
     });
   }, [messages, activeChat]);
+
+  // Mark incoming messages in active chat as read automatically
+  useEffect(() => {
+    if (!activeChat || !currentUser.id) return;
+    const hasUnreadFromOthers = messages.some(
+      (m) =>
+        m.chatId === activeChat.id &&
+        m.senderId !== currentUser.id &&
+        !(m.readBy || []).includes(currentUser.id)
+    );
+    if (!hasUnreadFromOthers) return;
+
+    setMessages((prev) =>
+      prev.map((m) => {
+        if (m.chatId !== activeChat.id) return m;
+        const currentReadBy = Array.isArray(m.readBy)
+          ? m.readBy
+          : m.senderId
+          ? [m.senderId]
+          : [];
+        if (currentReadBy.includes(currentUser.id)) return m;
+        return { ...m, readBy: [...currentReadBy, currentUser.id] };
+      })
+    );
+
+    emitWs('message:read', {
+      chatId: activeChat.id,
+      userId: currentUser.id,
+    });
+    if (authToken) {
+      fetch(`/api/chats/${activeChat.id}/read`, {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          Authorization: `Bearer ${authToken}`,
+        },
+      }).catch(() => {});
+    }
+  }, [activeChat?.id, messages.length, currentUser.id, authToken]);
 
   // Auto-scroll on new messages
   useEffect(() => {
@@ -2267,9 +2381,24 @@ export default function App() {
                           {formatTime(msg.createdAt)}
                         </span>
 
-                        {isOwn && (
-                          <CheckCheck className="w-3.5 h-3.5 text-sky-300 shrink-0" />
-                        )}
+                        {isOwn &&
+                          ((msg.readBy || []).some(
+                            (uid) => uid !== msg.senderId
+                          ) ? (
+                            <span
+                              title="Прочитано"
+                              className="inline-flex items-center"
+                            >
+                              <CheckCheck className="w-3.5 h-3.5 text-sky-300 shrink-0" />
+                            </span>
+                          ) : (
+                            <span
+                              title="Отправлено"
+                              className="inline-flex items-center"
+                            >
+                              <Check className="w-3.5 h-3.5 text-slate-300/80 shrink-0" />
+                            </span>
+                          ))}
                       </div>
                     </div>
                   </div>
@@ -2509,12 +2638,16 @@ export default function App() {
             chats.find((c) => c.id === callState.chatId) || activeChat
           }
           currentUser={currentUser}
-          onEndCall={() => setCallState(null)}
+          onEndCall={() => {
+            setCallState(null);
+            setIncomingSignalsQueue([]);
+          }}
           onUpdateCall={(patch) =>
             setCallState((prev) => (prev ? { ...prev, ...patch } : null))
           }
           sendSignal={(payload) => sendCallSignal(payload)}
           incomingSignal={incomingCallSignal}
+          incomingSignalsQueue={incomingSignalsQueue}
         />
       )}
 

@@ -2,10 +2,12 @@ export type ChatType = 'direct' | 'group' | 'channel';
 
 export interface UserProfile {
   id: string;
+  email?: string;
   handle: string;
   displayName: string;
   bio: string;
   avatarUrl?: string;
+  accentColor?: string;
   publicKeyFingerprint: string;
   publicKeyHex: string;
   status: 'online' | 'away' | 'offline';
@@ -65,6 +67,7 @@ export interface Message {
   e2ee: E2EEEnvelope;
   views?: number;
   reactions: MessageReaction[];
+  readBy?: string[];
 }
 
 export interface ChatRoom {
@@ -130,4 +133,5 @@ export interface CallState {
   isScreenSharing: boolean;
   remotePeerConnected: boolean;
   encryptionSAS: string;
+  minimized?: boolean;
 }

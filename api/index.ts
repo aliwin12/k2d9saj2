@@ -388,6 +388,9 @@ app.patch('/api/profile', async (req, res) => {
     if (patch.handle)
       user.handle = patch.handle.replace(/^@/, '').trim().toLowerCase();
     if (patch.bio !== undefined) user.bio = patch.bio;
+    if (patch.avatarUrl !== undefined) user.avatarUrl = patch.avatarUrl;
+    if (patch.accentColor !== undefined) user.accentColor = patch.accentColor;
+    if (patch.status) user.status = patch.status;
     if (patch.publicKeyHex) user.publicKeyHex = patch.publicKeyHex;
     if (patch.publicKeyFingerprint)
       user.publicKeyFingerprint = patch.publicKeyFingerprint;
@@ -429,11 +432,39 @@ app.post('/api/messages', async (req, res) => {
       ...payload,
       createdAt: payload.createdAt || new Date().toISOString(),
       reactions: payload.reactions || [],
+      readBy: Array.isArray(payload.readBy)
+        ? payload.readBy
+        : payload.senderId
+        ? [payload.senderId]
+        : [],
     };
     if (!memoryStore.messages.some((m) => m.id === msg.id)) {
       memoryStore.messages.push(msg);
     }
     return res.status(201).json(msg);
+  } catch (error: any) {
+    return res.status(401).json({ error: error.message || 'Unauthorized' });
+  }
+});
+
+app.post('/api/chats/:chatId/read', async (req, res) => {
+  try {
+    const decoded = await verifyRequestUser(req);
+    const chatId = req.params.chatId;
+    const uid = decoded.uid;
+    memoryStore.messages.forEach((m) => {
+      if (m.chatId === chatId) {
+        const currentReadBy: string[] = Array.isArray(m.readBy)
+          ? m.readBy
+          : m.senderId
+          ? [m.senderId]
+          : [];
+        if (!currentReadBy.includes(uid)) {
+          m.readBy = [...currentReadBy, uid];
+        }
+      }
+    });
+    return res.json({ ok: true, chatId, userId: uid });
   } catch (error: any) {
     return res.status(401).json({ error: error.message || 'Unauthorized' });
   }
