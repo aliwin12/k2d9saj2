@@ -25,7 +25,7 @@ interface CallStageModalProps {
   incomingSignal: any | null;
 }
 
-const CALL_RING_TIMEOUT_SECONDS = 30;
+const CALL_RING_DURATION_MS = 30000;
 
 export const CallStageModal: React.FC<CallStageModalProps> = ({
   call,
@@ -45,9 +45,6 @@ export const CallStageModal: React.FC<CallStageModalProps> = ({
   const ringtoneAudioRef = useRef<HTMLAudioElement | null>(null);
 
   const [elapsedSec, setElapsedSec] = useState(0);
-  const [ringRemainingSec, setRingRemainingSec] = useState(
-    CALL_RING_TIMEOUT_SECONDS
-  );
   const [audioLevel, setAudioLevel] = useState(18);
   const [mediaNotice, setMediaNotice] = useState<string | null>(null);
   const [expanded, setExpanded] = useState(false);
@@ -57,53 +54,42 @@ export const CallStageModal: React.FC<CallStageModalProps> = ({
     call.direction === 'outgoing' || call.initiatorId === currentUser.id;
   const isRinging = call.status === 'ringing';
 
-  // Play /call.mp3 (outgoing) or /incomingcall.mp3 (incoming) while ringing, and enforce 30s timeout
+  const stopRingtone = () => {
+    if (ringtoneAudioRef.current) {
+      ringtoneAudioRef.current.pause();
+      ringtoneAudioRef.current.currentTime = 0;
+      ringtoneAudioRef.current = null;
+    }
+  };
+
+  // Play /call.mp3 (outgoing) or /incomingcall.mp3 (incoming) for 30 seconds while ringing
   useEffect(() => {
     if (!isRinging) {
-      if (ringtoneAudioRef.current) {
-        ringtoneAudioRef.current.pause();
-        ringtoneAudioRef.current.currentTime = 0;
-        ringtoneAudioRef.current = null;
-      }
+      stopRingtone();
       return;
     }
 
     const soundSrc = isOutgoing ? '/call.mp3' : '/incomingcall.mp3';
     const audio = new Audio(soundSrc);
-    audio.loop = true;
-    audio.volume = 0.85;
+    audio.loop = false;
     ringtoneAudioRef.current = audio;
 
-    audio.play().catch(() => {
-      // Browser may require interaction before playing audio
-    });
+    audio.play().catch(() => {});
 
-    const ringStart = call.ringingStartedAt || Date.now();
-    const timer = setInterval(() => {
-      const passed = Math.floor((Date.now() - ringStart) / 1000);
-      const left = Math.max(0, CALL_RING_TIMEOUT_SECONDS - passed);
-      setRingRemainingSec(left);
-
-      if (passed >= CALL_RING_TIMEOUT_SECONDS) {
-        clearInterval(timer);
-        audio.pause();
-        sendSignal({
-          type: 'call-timeout',
-          callId: call.callId,
-          chatId: call.chatId,
-          senderId: currentUser.id,
-        });
-        onEndCall();
-      }
-    }, 250);
+    const timeoutId = setTimeout(() => {
+      stopRingtone();
+      sendSignal({
+        type: 'call-timeout',
+        callId: call.callId,
+        chatId: call.chatId,
+        senderId: currentUser.id,
+      });
+      onEndCall();
+    }, CALL_RING_DURATION_MS);
 
     return () => {
-      clearInterval(timer);
-      audio.pause();
-      audio.currentTime = 0;
-      if (ringtoneAudioRef.current === audio) {
-        ringtoneAudioRef.current = null;
-      }
+      clearTimeout(timeoutId);
+      stopRingtone();
     };
   }, [isRinging, isOutgoing, call.callId]);
 
@@ -120,7 +106,7 @@ export const CallStageModal: React.FC<CallStageModalProps> = ({
     return () => clearInterval(timer);
   }, [call.status, call.startedAt]);
 
-  // Initialize local media + WebRTC PeerConnection ONLY after call is accepted ('connected')
+  // Initialize local media + WebRTC PeerConnection once connected
   useEffect(() => {
     if (call.status !== 'connected') return;
 
@@ -239,9 +225,7 @@ export const CallStageModal: React.FC<CallStageModalProps> = ({
       incomingSignal.type === 'call-accept' &&
       incomingSignal.chatId === call.chatId
     ) {
-      if (ringtoneAudioRef.current) {
-        ringtoneAudioRef.current.pause();
-      }
+      stopRingtone();
       onUpdateCall({
         status: 'connected',
         remotePeerConnected: true,
@@ -256,9 +240,7 @@ export const CallStageModal: React.FC<CallStageModalProps> = ({
         incomingSignal.type === 'call-timeout') &&
       incomingSignal.chatId === call.chatId
     ) {
-      if (ringtoneAudioRef.current) {
-        ringtoneAudioRef.current.pause();
-      }
+      stopRingtone();
       onEndCall();
       return;
     }
@@ -392,9 +374,7 @@ export const CallStageModal: React.FC<CallStageModalProps> = ({
   }
 
   const handleAcceptIncomingCall = () => {
-    if (ringtoneAudioRef.current) {
-      ringtoneAudioRef.current.pause();
-    }
+    stopRingtone();
     const now = Date.now();
     onUpdateCall({
       status: 'connected',
@@ -411,9 +391,7 @@ export const CallStageModal: React.FC<CallStageModalProps> = ({
   };
 
   const handleRejectOrCancelCall = () => {
-    if (ringtoneAudioRef.current) {
-      ringtoneAudioRef.current.pause();
-    }
+    stopRingtone();
     sendSignal({
       type: isRinging ? 'call-reject' : 'call-end',
       callId: call.callId,
@@ -488,7 +466,7 @@ export const CallStageModal: React.FC<CallStageModalProps> = ({
     return `${m}:${s}`;
   };
 
-  // RENDER RINGING SCREEN (Outgoing or Incoming — rings for 30 seconds until accepted)
+  // RENDER RINGING SCREEN (Outgoing or Incoming — plays /call.mp3 or /incomingcall.mp3 for 30s)
   if (isRinging) {
     const targetTitle = isOutgoing
       ? chat?.title || 'Собеседник'
@@ -523,17 +501,11 @@ export const CallStageModal: React.FC<CallStageModalProps> = ({
 
           <p className="text-sm text-slate-300 mt-1">
             {isOutgoing
-              ? 'Звоним собеседнику... Ожидание ответа'
-              : `${call.initiatorName || 'Собеседник'} вызывает вас (${
+              ? 'Идёт вызов...'
+              : `${call.initiatorName || 'Собеседник'} звонит вам (${
                   call.mode === 'video' ? 'Видеозвонок' : 'Аудиозвонок'
                 })`}
           </p>
-
-          <div className="mt-4 px-3.5 py-1.5 rounded-full bg-[#0E1621] border border-slate-800 text-xs text-slate-400 tabular-nums">
-            Автоотмена через{' '}
-            <span className="text-white font-semibold">{ringRemainingSec}</span>{' '}
-            сек.
-          </div>
 
           <div className="mt-8 flex items-center justify-center gap-6 w-full">
             {!isOutgoing && (
@@ -553,7 +525,7 @@ export const CallStageModal: React.FC<CallStageModalProps> = ({
               className="flex-1 py-3.5 px-5 rounded-2xl bg-red-600 hover:bg-red-500 text-white font-semibold text-sm flex items-center justify-center gap-2 shadow-lg shadow-red-600/25 transition-colors"
             >
               <PhoneOff className="w-4 h-4" />
-              <span>{isOutgoing ? 'Отменить вызов' : 'Отклонить'}</span>
+              <span>{isOutgoing ? 'Сбросить' : 'Отклонить'}</span>
             </button>
           </div>
         </div>

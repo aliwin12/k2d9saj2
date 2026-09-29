@@ -190,6 +190,7 @@ export default function App() {
   const activeChatIdRef = useRef<string>(activeChatId);
   const chatsRef = useRef<ChatRoom[]>(chats);
   const notificationsEnabledRef = useRef<boolean>(notificationsEnabled);
+  const processedSignalIdsRef = useRef<Set<string>>(new Set());
 
   useEffect(() => {
     currentUserIdRef.current = currentUserId;
@@ -208,10 +209,15 @@ export default function App() {
 
   useEffect(() => {
     chatsRef.current = chats;
-    if (!activeChatId && chats.length > 0) {
-      setActiveChatId(chats[0].id);
+    const userChats = chats.filter(
+      (c) =>
+        c.memberIds?.includes(currentUserId) ||
+        c.adminIds?.includes(currentUserId)
+    );
+    if (!activeChatId && userChats.length > 0) {
+      setActiveChatId(userChats[0].id);
     }
-  }, [chats, activeChatId]);
+  }, [chats, activeChatId, currentUserId]);
 
   useEffect(() => {
     notificationsEnabledRef.current = notificationsEnabled;
@@ -449,9 +455,65 @@ export default function App() {
             prev.map((b) => (b.id === payload.id ? payload : b))
           );
           break;
-        case 'call:signal':
-          setIncomingCallSignal(payload);
+        case 'call:signal': {
+          if (!payload || payload.senderId === currentUserIdRef.current) break;
+          if (payload.signalId) {
+            if (processedSignalIdsRef.current.has(payload.signalId)) break;
+            processedSignalIdsRef.current.add(payload.signalId);
+          }
+
+          const targetChat = chatsRef.current.find(
+            (c) => c.id === payload.chatId
+          );
+          const isMember =
+            !targetChat ||
+            targetChat.memberIds?.includes(currentUserIdRef.current) ||
+            targetChat.adminIds?.includes(currentUserIdRef.current);
+          if (!isMember) break;
+
+          if (payload.type === 'call-invite') {
+            setCallState({
+              active: true,
+              callId: payload.callId,
+              chatId: payload.chatId,
+              mode: payload.mode || 'audio',
+              initiatorId: payload.senderId,
+              initiatorName: payload.senderName || 'Собеседник',
+              direction: 'incoming',
+              ringingStartedAt: Date.now(),
+              status: 'ringing',
+              isMuted: false,
+              isCameraOn: payload.mode === 'video',
+              isScreenSharing: false,
+              remotePeerConnected: false,
+              encryptionSAS: payload.encryptionSAS || 'CALL',
+            });
+          } else if (payload.type === 'call-accept') {
+            setCallState((prev) =>
+              prev && prev.chatId === payload.chatId
+                ? {
+                    ...prev,
+                    status: 'connected',
+                    remotePeerConnected: true,
+                    startedAt: Date.now(),
+                  }
+                : prev
+            );
+            setIncomingCallSignal(payload);
+          } else if (
+            payload.type === 'call-reject' ||
+            payload.type === 'call-end' ||
+            payload.type === 'call-timeout'
+          ) {
+            setCallState((prev) =>
+              prev && prev.chatId === payload.chatId ? null : prev
+            );
+            setIncomingCallSignal(payload);
+          } else {
+            setIncomingCallSignal(payload);
+          }
           break;
+        }
       }
     };
 
@@ -493,9 +555,29 @@ export default function App() {
 
     connectWs();
 
+    const statePollTimer = setInterval(async () => {
+      if (isUnmounted) return;
+      try {
+        const res = await fetch('/api/state', {
+          headers: { Authorization: `Bearer ${authToken}` },
+        });
+        if (!res.ok) return;
+        const data = await res.json();
+        applyServerState(data);
+        if (Array.isArray(data.callSignals)) {
+          data.callSignals.forEach((sig: any) => {
+            handleRealtimeEvent('call:signal', sig);
+          });
+        }
+      } catch {
+        // Ignore transient network poll error
+      }
+    }, 2000);
+
     return () => {
       isUnmounted = true;
       clearTimeout(reconnectTimer);
+      clearInterval(statePollTimer);
       wsRef.current?.close();
       broadcastChannelRef.current?.close();
     };
@@ -505,6 +587,28 @@ export default function App() {
     broadcastChannelRef.current?.postMessage({ event, payload });
     if (wsRef.current && wsRef.current.readyState === WebSocket.OPEN) {
       wsRef.current.send(JSON.stringify({ event, payload, token: authToken }));
+    }
+  };
+
+  const sendCallSignal = (payload: any) => {
+    const sig = {
+      ...payload,
+      signalId:
+        payload?.signalId ||
+        `sig_${Date.now()}_${Math.random().toString(36).slice(2, 7)}`,
+      timestamp: Date.now(),
+    };
+    processedSignalIdsRef.current.add(sig.signalId);
+    emitWs('call:signal', sig);
+    if (authToken) {
+      fetch('/api/calls/signal', {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          Authorization: `Bearer ${authToken}`,
+        },
+        body: JSON.stringify(sig),
+      }).catch(() => {});
     }
   };
 
@@ -663,9 +767,18 @@ export default function App() {
     );
   }, [users, currentUserId, firebaseUser, directAccount]);
 
+  const myChats = useMemo(() => {
+    if (!currentUser.id) return [];
+    return chats.filter(
+      (c) =>
+        c.memberIds?.includes(currentUser.id) ||
+        c.adminIds?.includes(currentUser.id)
+    );
+  }, [chats, currentUser.id]);
+
   const activeChat: ChatRoom | undefined = useMemo(() => {
-    return chats.find((c) => c.id === activeChatId) || chats[0];
-  }, [chats, activeChatId]);
+    return myChats.find((c) => c.id === activeChatId) || myChats[0];
+  }, [myChats, activeChatId]);
 
   // Decrypt messages in active chat with Web Crypto API
   useEffect(() => {
@@ -688,7 +801,7 @@ export default function App() {
   }, [messages.length, activeChatId]);
 
   const filteredChats = useMemo(() => {
-    return chats.filter((c) => {
+    return myChats.filter((c) => {
       if (categoryFilter !== 'all' && c.type !== categoryFilter) return false;
       if (searchQuery.trim()) {
         const q = searchQuery.toLowerCase();
@@ -700,11 +813,19 @@ export default function App() {
       }
       return true;
     });
-  }, [chats, categoryFilter, searchQuery]);
+  }, [myChats, categoryFilter, searchQuery]);
 
-  const otherRegisteredUsers = useMemo(() => {
-    return users.filter((u) => u.id !== currentUser.id);
-  }, [users, currentUser.id]);
+  const searchedUsersToAdd = useMemo(() => {
+    const q = searchQuery.trim().toLowerCase().replace(/^@/, '');
+    if (q.length < 2) return [];
+    return users.filter(
+      (u) =>
+        u.id !== currentUser.id &&
+        (u.handle.toLowerCase() === q ||
+          u.handle.toLowerCase().includes(q) ||
+          (u.email && u.email.toLowerCase() === q))
+    );
+  }, [users, currentUser.id, searchQuery]);
 
   const activeChatMessages = useMemo(() => {
     if (!activeChat) return [];
@@ -1127,22 +1248,34 @@ export default function App() {
 
   const handleStartCall = async (mode: 'audio' | 'video' | 'screen') => {
     if (!activeChat) return;
+    const callId = `call_${Date.now()}`;
     const sasHash = await formatFingerprint(
       `${activeChat.e2eeKeySeed}:${Date.now()}`
     );
     setCallState({
       active: true,
-      callId: `call_${Date.now()}`,
+      callId,
       chatId: activeChat.id,
       mode,
       initiatorId: currentUser.id,
       initiatorName: currentUser.displayName,
+      direction: 'outgoing',
+      ringingStartedAt: Date.now(),
       status: 'ringing',
-      startedAt: Date.now(),
       isMuted: false,
       isCameraOn: mode === 'video',
       isScreenSharing: mode === 'screen',
       remotePeerConnected: false,
+      encryptionSAS: sasHash.slice(0, 14),
+    });
+    sendCallSignal({
+      type: 'call-invite',
+      callId,
+      chatId: activeChat.id,
+      chatTitle: activeChat.title,
+      mode,
+      senderId: currentUser.id,
+      senderName: currentUser.displayName,
       encryptionSAS: sasHash.slice(0, 14),
     });
   };
@@ -1761,16 +1894,18 @@ export default function App() {
               })
             )}
 
-            {/* Real Registered Users Directory (if other real accounts exist in DB) */}
-            {otherRegisteredUsers.length > 0 && (
+            {searchedUsersToAdd.length > 0 && (
               <div className="mt-2 pt-2 border-t border-slate-800/70">
                 <div className="px-4 py-1.5 text-[11px] font-semibold uppercase tracking-wider text-slate-400">
-                  Пользователи ClickChat ({otherRegisteredUsers.length})
+                  Найденные по запросу
                 </div>
-                {otherRegisteredUsers.map((u) => (
+                {searchedUsersToAdd.map((u) => (
                   <button
                     key={u.id}
-                    onClick={() => handleStartDirectChatWithUser(u)}
+                    onClick={() => {
+                      handleStartDirectChatWithUser(u);
+                      setSearchQuery('');
+                    }}
                     className="w-full text-left px-3.5 py-2 flex items-center gap-3 hover:bg-[#202B36] transition-colors"
                   >
                     <Avatar
@@ -2370,13 +2505,15 @@ export default function App() {
       {callState && callState.active && (
         <CallStageModal
           call={callState}
-          chat={activeChat}
+          chat={
+            chats.find((c) => c.id === callState.chatId) || activeChat
+          }
           currentUser={currentUser}
           onEndCall={() => setCallState(null)}
           onUpdateCall={(patch) =>
             setCallState((prev) => (prev ? { ...prev, ...patch } : null))
           }
-          sendSignal={(payload) => emitWs('call:signal', payload)}
+          sendSignal={(payload) => sendCallSignal(payload)}
           incomingSignal={incomingCallSignal}
         />
       )}

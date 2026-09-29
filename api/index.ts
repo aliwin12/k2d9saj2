@@ -87,12 +87,14 @@ const memoryStore: {
   chats: any[];
   messages: any[];
   bots: any[];
+  callSignals: any[];
 } = {
   users: [],
   devices: [],
   chats: [],
   messages: [],
   bots: [],
+  callSignals: [],
 };
 
 const TOKEN_SECRET =
@@ -344,7 +346,33 @@ app.post('/api/auth/session', async (req, res) => {
 app.get('/api/state', async (req, res) => {
   try {
     await verifyRequestUser(req);
+    const now = Date.now();
+    memoryStore.callSignals = memoryStore.callSignals.filter(
+      (s) => now - (s.timestamp || 0) < 35000
+    );
     return res.json(memoryStore);
+  } catch (error: any) {
+    return res.status(401).json({ error: error.message || 'Unauthorized' });
+  }
+});
+
+app.post('/api/calls/signal', async (req, res) => {
+  try {
+    await verifyRequestUser(req);
+    const payload = req.body || {};
+    const signal = {
+      ...payload,
+      signalId:
+        payload.signalId ||
+        `sig_${Date.now()}_${Math.random().toString(36).slice(2, 7)}`,
+      timestamp: Date.now(),
+    };
+    const now = Date.now();
+    memoryStore.callSignals = memoryStore.callSignals.filter(
+      (s) => now - (s.timestamp || 0) < 35000
+    );
+    memoryStore.callSignals.push(signal);
+    return res.json({ ok: true, signal });
   } catch (error: any) {
     return res.status(401).json({ error: error.message || 'Unauthorized' });
   }

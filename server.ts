@@ -2,6 +2,7 @@ import express from 'express';
 import { createServer } from 'http';
 import { WebSocketServer, WebSocket } from 'ws';
 import { createServer as createViteServer } from 'vite';
+import fs from 'fs';
 import path from 'path';
 import crypto from 'crypto';
 import {
@@ -261,6 +262,40 @@ async function startServer() {
     }
   });
 
+  let recentCallSignals: any[] = [];
+
+  function recordCallSignal(payload: any) {
+    const now = Date.now();
+    recentCallSignals = recentCallSignals.filter(
+      (s) => now - (s.timestamp || 0) < 35000
+    );
+    const sig = {
+      ...payload,
+      signalId:
+        payload?.signalId ||
+        `sig_${now}_${Math.random().toString(36).slice(2, 7)}`,
+      timestamp: now,
+    };
+    if (!recentCallSignals.some((s) => s.signalId === sig.signalId)) {
+      recentCallSignals.push(sig);
+    }
+    return sig;
+  }
+
+  // Serve call.mp3 and incomingcall.mp3 from root or public/ if uploaded by user
+  app.get(['/call.mp3', '/incomingcall.mp3'], (req, res, next) => {
+    const fileName = req.path.replace(/^\//, '');
+    const rootFile = path.resolve(process.cwd(), fileName);
+    const publicFile = path.resolve(process.cwd(), 'public', fileName);
+    if (fs.existsSync(rootFile)) {
+      return res.sendFile(rootFile);
+    }
+    if (fs.existsSync(publicFile)) {
+      return res.sendFile(publicFile);
+    }
+    next();
+  });
+
   // Get full application state from PostgreSQL
   app.get('/api/state', requireAuth, async (req: AuthRequest, res) => {
     try {
@@ -271,11 +306,25 @@ async function startServer() {
         displayName: decoded.name,
         avatarUrl: decoded.picture,
       });
+      const now = Date.now();
+      recentCallSignals = recentCallSignals.filter(
+        (s) => now - (s.timestamp || 0) < 35000
+      );
       const state = await getFullApplicationState();
-      res.json(state);
+      res.json({ ...state, callSignals: recentCallSignals });
     } catch (error: any) {
       console.error('Failed to fetch state:', error);
       res.status(500).json({ error: error.message || 'Failed to fetch state' });
+    }
+  });
+
+  app.post('/api/calls/signal', requireAuth, async (req: AuthRequest, res) => {
+    try {
+      const sig = recordCallSignal(req.body || {});
+      broadcast('call:signal', sig);
+      return res.json({ ok: true, signal: sig });
+    } catch (error: any) {
+      return res.status(500).json({ error: error.message || 'Signal error' });
     }
   });
 
@@ -758,7 +807,8 @@ async function startServer() {
           }
 
           case 'call:signal': {
-            broadcast('call:signal', payload, ws);
+            const sig = recordCallSignal(payload);
+            broadcast('call:signal', sig, ws);
             break;
           }
         }
