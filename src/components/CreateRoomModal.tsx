@@ -63,8 +63,10 @@ export const CreateRoomModal: React.FC<CreateRoomModalProps> = ({
       description:
         description.trim() ||
         (type === 'channel'
-          ? 'Независимый вещательный канал со сквозной подписью публикаций'
-          : 'Защищенная комната со сквозным шифрованием AES-256-GCM'),
+          ? 'Информационный канал'
+          : type === 'group'
+          ? 'Групповой чат'
+          : 'Личный чат'),
       memberIds: Array.from(new Set([currentUser.id, ...selectedMembers])),
       adminIds: [currentUser.id],
       botIds: selectedBots,
@@ -109,7 +111,7 @@ export const CreateRoomModal: React.FC<CreateRoomModalProps> = ({
               }`}
             >
               <MessageSquareLock className="w-3.5 h-3.5" />
-              <span>Личный E2EE</span>
+              <span>Личный чат</span>
             </button>
             <button
               type="button"
@@ -142,16 +144,16 @@ export const CreateRoomModal: React.FC<CreateRoomModalProps> = ({
               {type === 'channel'
                 ? 'Название канала'
                 : type === 'group'
-                ? 'Название группового чата'
-                : 'Тема защищенного диалога'}
+                ? 'Название группы'
+                : 'Название чата'}
             </label>
             <input
               type="text"
               required
               placeholder={
                 type === 'channel'
-                  ? 'напр. ClickChat Крипто-Дайджест'
-                  : 'напр. Разработка протокола v3'
+                  ? 'Например, Новости проекта'
+                  : 'Например, Команда разработки'
               }
               value={title}
               onChange={(e) => setTitle(e.target.value)}
@@ -159,36 +161,26 @@ export const CreateRoomModal: React.FC<CreateRoomModalProps> = ({
             />
           </div>
 
-          <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
-            <div>
-              <label className="block text-xs text-slate-400 mb-1">
-                Публичный @handle
-              </label>
-              <input
-                type="text"
-                placeholder="@channel_handle"
-                value={handle}
-                onChange={(e) => setHandle(e.target.value)}
-                className="w-full px-3 py-2 rounded-lg bg-slate-900 border border-slate-800 text-xs font-mono text-slate-100 focus:outline-none focus:border-emerald-500"
-              />
-            </div>
-            <div>
-              <label className="block text-xs text-slate-400 mb-1">
-                Алгоритм ключей
-              </label>
-              <div className="px-3 py-2 rounded-lg bg-slate-950 border border-slate-800 text-xs font-mono text-emerald-400">
-                AES-256-GCM / ECDH
-              </div>
-            </div>
+          <div>
+            <label className="block text-xs text-slate-400 mb-1">
+              Короткая ссылка (@handle)
+            </label>
+            <input
+              type="text"
+              placeholder="@username"
+              value={handle}
+              onChange={(e) => setHandle(e.target.value)}
+              className="w-full px-3 py-2 rounded-lg bg-slate-900 border border-slate-800 text-xs font-mono text-slate-100 focus:outline-none focus:border-emerald-500"
+            />
           </div>
 
           <div>
             <label className="block text-xs text-slate-400 mb-1">
-              Описание / манифест комнаты
+              Описание
             </label>
             <input
               type="text"
-              placeholder="Краткое описание назначения чата или канала"
+              placeholder="Краткое описание (необязательно)"
               value={description}
               onChange={(e) => setDescription(e.target.value)}
               className="w-full px-3.5 py-2 rounded-lg bg-slate-900 border border-slate-800 text-xs text-slate-100 focus:outline-none focus:border-emerald-500"
@@ -259,7 +251,7 @@ export const CreateRoomModal: React.FC<CreateRoomModalProps> = ({
               type="submit"
               className="px-5 py-2 rounded-lg bg-emerald-500 hover:bg-emerald-400 text-slate-950 text-xs font-semibold"
             >
-              Создать и сгенерировать ключи
+              Создать
             </button>
           </div>
         </form>

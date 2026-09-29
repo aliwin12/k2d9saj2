@@ -26,6 +26,9 @@ import {
   SlidersHorizontal,
   Radio,
   MessageSquarePlus,
+  Mic,
+  Square,
+  Trash2,
 } from 'lucide-react';
 import {
   onAuthStateChanged,
@@ -66,6 +69,7 @@ import { BotApiDrawer } from './components/BotApiDrawer';
 import { ProfileSyncModal } from './components/ProfileSyncModal';
 import { CreateRoomModal } from './components/CreateRoomModal';
 import { RightInspectorPanel } from './components/RightInspectorPanel';
+import { VoiceMessagePlayer } from './components/VoiceMessagePlayer';
 
 interface InAppToast {
   id: string;
@@ -140,6 +144,14 @@ export default function App() {
   const [showCiphertextMode, setShowCiphertextMode] = useState(false);
   const [showEmojiPicker, setShowEmojiPicker] = useState(false);
 
+  // Voice Message Recording State (MediaRecorder API)
+  const [isRecordingVoice, setIsRecordingVoice] = useState(false);
+  const [recordingSeconds, setRecordingSeconds] = useState(0);
+  const [liveWaveform, setLiveWaveform] = useState<number[]>(() =>
+    Array.from({ length: 24 }, () => 0.25)
+  );
+  const [voiceError, setVoiceError] = useState<string | null>(null);
+
   // Modals & Drawers
   const [showBotDrawer, setShowBotDrawer] = useState(false);
   const [showProfileModal, setShowProfileModal] = useState(false);
@@ -162,6 +174,17 @@ export default function App() {
   const broadcastChannelRef = useRef<BroadcastChannel | null>(null);
   const messagesEndRef = useRef<HTMLDivElement | null>(null);
   const fileInputRef = useRef<HTMLInputElement | null>(null);
+
+  // MediaRecorder Refs
+  const mediaRecorderRef = useRef<MediaRecorder | null>(null);
+  const audioChunksRef = useRef<Blob[]>([]);
+  const recordingStreamRef = useRef<MediaStream | null>(null);
+  const recordingTimerRef = useRef<any>(null);
+  const animationFrameRef = useRef<number | null>(null);
+  const audioContextRef = useRef<AudioContext | null>(null);
+  const discardRecordingRef = useRef<boolean>(false);
+  const recordedWaveformHistoryRef = useRef<number[]>([]);
+  const recordingStartTimeRef = useRef<number>(0);
 
   const currentUserIdRef = useRef<string>(currentUserId);
   const activeChatIdRef = useRef<string>(activeChatId);
@@ -230,7 +253,10 @@ export default function App() {
         ? `${msg.senderName} в «${chatTitle}»`
         : msg.senderName;
     const bodyText = msg.attachment
-      ? `📎 Файл: ${msg.attachment.name}`
+      ? msg.attachment.isVoiceMessage ||
+        msg.attachment.mimeType?.startsWith('audio/')
+        ? '🎤 Голосовое сообщение'
+        : `📎 ${msg.attachment.name}`
       : msg.text;
 
     playNotificationSound();
@@ -731,7 +757,7 @@ export default function App() {
       type: 'direct',
       title: peer.displayName,
       handle: peer.handle,
-      description: `Личный зашифрованный диалог с @${peer.handle}`,
+      description: `Личный чат с @${peer.handle}`,
       avatarUrl: peer.avatarUrl || '',
       memberIds: [currentUser.id, peer.id],
       adminIds: [currentUser.id, peer.id],
@@ -838,6 +864,265 @@ export default function App() {
     };
     reader.readAsDataURL(file);
     e.target.value = '';
+  };
+
+  const cleanupVoiceRecordingResources = useCallback(() => {
+    if (recordingTimerRef.current) {
+      clearInterval(recordingTimerRef.current);
+      recordingTimerRef.current = null;
+    }
+    if (animationFrameRef.current) {
+      cancelAnimationFrame(animationFrameRef.current);
+      animationFrameRef.current = null;
+    }
+    if (recordingStreamRef.current) {
+      recordingStreamRef.current.getTracks().forEach((t) => t.stop());
+      recordingStreamRef.current = null;
+    }
+    if (audioContextRef.current) {
+      audioContextRef.current.close().catch(() => {});
+      audioContextRef.current = null;
+    }
+    mediaRecorderRef.current = null;
+    setIsRecordingVoice(false);
+    setRecordingSeconds(0);
+  }, []);
+
+  const startVoiceRecording = async () => {
+    if (!activeChat || isRecordingVoice) return;
+    setVoiceError(null);
+
+    if (
+      !navigator.mediaDevices ||
+      !navigator.mediaDevices.getUserMedia ||
+      typeof MediaRecorder === 'undefined'
+    ) {
+      setVoiceError('Ваш браузер не поддерживает запись голосовых сообщений.');
+      return;
+    }
+
+    try {
+      const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+      recordingStreamRef.current = stream;
+      audioChunksRef.current = [];
+      recordedWaveformHistoryRef.current = [];
+      discardRecordingRef.current = false;
+      recordingStartTimeRef.current = Date.now();
+
+      const preferredTypes = [
+        'audio/webm;codecs=opus',
+        'audio/webm',
+        'audio/ogg;codecs=opus',
+        'audio/mp4',
+      ];
+      const supportedMimeType =
+        preferredTypes.find((t) => MediaRecorder.isTypeSupported(t)) || '';
+
+      const recorder = supportedMimeType
+        ? new MediaRecorder(stream, { mimeType: supportedMimeType })
+        : new MediaRecorder(stream);
+
+      mediaRecorderRef.current = recorder;
+
+      // Setup Web Audio API Analyser for live waveform animation
+      try {
+        const AudioCtx =
+          window.AudioContext || (window as any).webkitAudioContext;
+        if (AudioCtx) {
+          const audioCtx = new AudioCtx();
+          audioContextRef.current = audioCtx;
+          const source = audioCtx.createMediaStreamSource(stream);
+          const analyser = audioCtx.createAnalyser();
+          analyser.fftSize = 64;
+          source.connect(analyser);
+          const dataArray = new Uint8Array(analyser.frequencyBinCount);
+
+          const updateWaveform = () => {
+            analyser.getByteFrequencyData(dataArray);
+            const bars: number[] = [];
+            const count = 24;
+            let avgSum = 0;
+            for (let i = 0; i < count; i++) {
+              const val = dataArray[i % dataArray.length] / 255;
+              const normalized = Math.max(0.18, Math.min(1, val * 1.35));
+              bars.push(normalized);
+              avgSum += normalized;
+            }
+            setLiveWaveform(bars);
+            recordedWaveformHistoryRef.current.push(avgSum / count);
+            animationFrameRef.current = requestAnimationFrame(updateWaveform);
+          };
+          animationFrameRef.current = requestAnimationFrame(updateWaveform);
+        }
+      } catch {
+        // Fallback waveform if AudioContext fails
+      }
+
+      recorder.ondataavailable = (evt) => {
+        if (evt.data && evt.data.size > 0) {
+          audioChunksRef.current.push(evt.data);
+        }
+      };
+
+      recorder.onstop = async () => {
+        const shouldDiscard = discardRecordingRef.current;
+        const durationSec = Math.max(
+          1,
+          Math.round((Date.now() - recordingStartTimeRef.current) / 1000)
+        );
+        const chunks = [...audioChunksRef.current];
+        const mimeType = recorder.mimeType || supportedMimeType || 'audio/webm';
+
+        // Downsample recorded waveform history into 24 bars
+        const rawHistory = recordedWaveformHistoryRef.current;
+        const finalWaveform: number[] = [];
+        for (let i = 0; i < 24; i++) {
+          if (rawHistory.length === 0) {
+            finalWaveform.push(0.3 + ((i * 7) % 5) * 0.12);
+          } else {
+            const idx = Math.floor((i / 24) * rawHistory.length);
+            finalWaveform.push(
+              Math.max(0.2, Math.min(0.98, rawHistory[idx] || 0.35))
+            );
+          }
+        }
+
+        cleanupVoiceRecordingResources();
+
+        if (shouldDiscard || chunks.length === 0 || !activeChat) {
+          return;
+        }
+
+        const audioBlob = new Blob(chunks, { type: mimeType });
+        const reader = new FileReader();
+        reader.onload = async () => {
+          const dataUrl = String(reader.result || '');
+          const hash = await sha256Hex(
+            `voice:${audioBlob.size}:${dataUrl.slice(0, 256)}`
+          );
+          const ivBytes = crypto.getRandomValues(new Uint8Array(12));
+          const ivHex = Array.from(ivBytes)
+            .map((b) => b.toString(16).padStart(2, '0'))
+            .join('');
+
+          const ext = mimeType.includes('mp4')
+            ? 'm4a'
+            : mimeType.includes('ogg')
+            ? 'ogg'
+            : 'webm';
+          const voiceAttachment: FileAttachment = {
+            id: `voice_${Date.now()}`,
+            name: `Голосовое сообщение.${ext}`,
+            size: audioBlob.size,
+            mimeType,
+            dataUrl,
+            encrypted: true,
+            ivHex,
+            sha256Hex: hash,
+            isVoiceMessage: true,
+            durationSeconds: durationSec,
+            waveform: finalWaveform,
+          };
+
+          const textLabel = draftText.trim() || 'Голосовое сообщение';
+          const e2eeEnvelope = await encryptMessagePayload(
+            `${textLabel}:voice:${hash.slice(0, 16)}`,
+            activeChat.e2eeKeySeed,
+            currentUser.publicKeyFingerprint
+          );
+
+          const newMsg: Message = {
+            id: `msg_${Date.now()}_${Math.random().toString(36).slice(2, 7)}`,
+            chatId: activeChat.id,
+            senderId: currentUser.id,
+            senderName:
+              activeChat.type === 'channel'
+                ? activeChat.title
+                : currentUser.displayName,
+            senderHandle:
+              activeChat.type === 'channel'
+                ? activeChat.handle || currentUser.handle
+                : currentUser.handle,
+            text: textLabel,
+            createdAt: new Date().toISOString(),
+            replyToId: replyToMessage?.id,
+            attachment: voiceAttachment,
+            e2ee: e2eeEnvelope,
+            views:
+              activeChat.type === 'channel'
+                ? activeChat.subscriberCount
+                : undefined,
+            reactions: [],
+          };
+
+          setMessages((prev) => [...prev, newMsg]);
+          setDecryptedMap((prev) => ({ ...prev, [newMsg.id]: textLabel }));
+          setDraftText('');
+          setReplyToMessage(null);
+
+          emitWs('message:send', newMsg);
+          try {
+            await fetch('/api/messages', {
+              method: 'POST',
+              headers: {
+                'Content-Type': 'application/json',
+                Authorization: `Bearer ${authToken}`,
+              },
+              body: JSON.stringify(newMsg),
+            });
+          } catch {
+            // Handled via WS
+          }
+        };
+        reader.readAsDataURL(audioBlob);
+      };
+
+      recorder.start(150);
+      setIsRecordingVoice(true);
+      setRecordingSeconds(0);
+      recordingTimerRef.current = setInterval(() => {
+        setRecordingSeconds((prev) => prev + 1);
+      }, 1000);
+    } catch (err: any) {
+      cleanupVoiceRecordingResources();
+      setVoiceError(
+        'Нет доступа к микрофону. Разрешите использование микрофона в браузере.'
+      );
+    }
+  };
+
+  const cancelVoiceRecording = () => {
+    discardRecordingRef.current = true;
+    if (
+      mediaRecorderRef.current &&
+      mediaRecorderRef.current.state !== 'inactive'
+    ) {
+      mediaRecorderRef.current.stop();
+    } else {
+      cleanupVoiceRecordingResources();
+    }
+  };
+
+  const finishAndSendVoiceRecording = () => {
+    discardRecordingRef.current = false;
+    if (
+      mediaRecorderRef.current &&
+      mediaRecorderRef.current.state !== 'inactive'
+    ) {
+      mediaRecorderRef.current.stop();
+    }
+  };
+
+  const formatRecordingTimer = (sec: number) => {
+    const m = Math.floor(sec / 60);
+    const s = sec % 60;
+    return `${m}:${s.toString().padStart(2, '0')}`;
+  };
+
+  const formatFileSize = (bytes: number) => {
+    if (bytes < 1024) return `${bytes} Б`;
+    if (bytes < 1024 * 1024) return `${(bytes / 1024).toFixed(1)} КБ`;
+    return `${(bytes / (1024 * 1024)).toFixed(2)} МБ`;
   };
 
   const handleStartCall = async (mode: 'audio' | 'video' | 'screen') => {
@@ -1002,44 +1287,44 @@ export default function App() {
         <main className="max-w-5xl w-full mx-auto grid grid-cols-1 lg:grid-cols-12 gap-10 items-center my-auto py-12">
           <div className="lg:col-span-7 flex flex-col gap-5">
             <div className="text-xs font-medium text-sky-400">
-              Независимый мессенджер · Сквозное шифрование E2EE
+              ClickChat · Веб-мессенджер
             </div>
             <h1
               className="text-3xl sm:text-4xl font-bold text-white tracking-tight leading-tight"
               style={{ textWrap: 'balance' }}
             >
-              Реальные аккаунты, защищенные чаты, группы и вещательные каналы
+              Личные чаты, голосовые сообщения, группы и каналы
             </h1>
             <p className="text-base text-slate-300 leading-relaxed max-w-2xl">
-              Авторизуйтесь под своим реальным аккаунтом, создавайте собственные личные чаты, групповые комнаты, каналы и ботов с синхронизацией в PostgreSQL и браузерными push-уведомлениями.
+              Общайтесь с друзьями и коллегами, отправляйте голосовые заметки и файлы, созванивайтесь по аудио и видео, ведите каналы и подключайте ботов.
             </p>
 
             <div className="grid grid-cols-1 sm:grid-cols-3 gap-4 pt-2">
               <div className="p-4 rounded-2xl bg-[#17212B] border border-slate-800/90">
-                <KeyRound className="w-4 h-4 text-sky-400 mb-2" />
+                <Mic className="w-4 h-4 text-sky-400 mb-2" />
                 <div className="text-xs font-semibold text-white">
-                  Сквозное шифрование
+                  Голосовые и файлы
                 </div>
                 <p className="text-xs text-slate-400 mt-1">
-                  Шифрование сообщений и файлов на устройстве по протоколу AES-256-GCM.
+                  Мгновенная запись голосовых сообщений с микрофона и обмен документами.
                 </p>
               </div>
               <div className="p-4 rounded-2xl bg-[#17212B] border border-slate-800/90">
                 <Users className="w-4 h-4 text-sky-400 mb-2" />
                 <div className="text-xs font-semibold text-white">
-                  Звонки, Группы и Каналы
+                  Звонки, группы и каналы
                 </div>
                 <p className="text-xs text-slate-400 mt-1">
-                  Аудио/видео-звонки WebRTC, демонстрация экрана и собственные каналы.
+                  Аудио- и видеозвонки, демонстрация экрана и тематические каналы.
                 </p>
               </div>
               <div className="p-4 rounded-2xl bg-[#17212B] border border-slate-800/90">
                 <Bot className="w-4 h-4 text-sky-400 mb-2" />
                 <div className="text-xs font-semibold text-white">
-                  Боты и Push-уведомления
+                  Боты и уведомления
                 </div>
                 <p className="text-xs text-slate-400 mt-1">
-                  Нативные браузерные уведомления (Notifications API) и открытый Bot API.
+                  Уведомления о новых сообщениях и удобный API для создания своих ботов.
                 </p>
               </div>
             </div>
@@ -1054,11 +1339,11 @@ export default function App() {
                 <div>
                   <h2 className="text-base font-semibold text-white">
                     {authMode === 'login'
-                      ? 'Вход в аккаунт ClickChat'
-                      : 'Регистрация аккаунта'}
+                      ? 'Вход в ClickChat'
+                      : 'Создание аккаунта'}
                   </h2>
                   <p className="text-xs text-slate-400">
-                    Только реальные пользователи и чаты
+                    Войдите через Google или по Email
                   </p>
                 </div>
               </div>
@@ -1157,8 +1442,8 @@ export default function App() {
         </main>
 
         <footer className="max-w-6xl w-full mx-auto text-xs text-slate-500 flex items-center justify-between">
-          <span>ClickChat · Независимый зашифрованный мессенджер</span>
-          <span>PostgreSQL · WebRTC · Notifications API</span>
+          <span>ClickChat</span>
+          <span>Чаты · Звонки · Каналы · Боты</span>
         </footer>
       </div>
     );
@@ -1423,11 +1708,6 @@ export default function App() {
                           <span className="text-sm font-semibold text-white truncate">
                             {chat.title}
                           </span>
-                          <Lock
-                            className={`w-3 h-3 shrink-0 ${
-                              isSelected ? 'text-sky-200' : 'text-emerald-400'
-                            }`}
-                          />
                         </div>
                         {lastMsg && (
                           <span
@@ -1583,12 +1863,6 @@ export default function App() {
                     <h1 className="text-sm font-semibold text-white truncate">
                       {activeChat.title}
                     </h1>
-                    <span
-                      title="Защищено сквозным шифрованием E2EE"
-                      className="shrink-0 flex"
-                    >
-                      <Lock className="w-3.5 h-3.5 text-emerald-400" />
-                    </span>
                   </div>
                   <div className="text-xs text-slate-400 truncate">
                     {activeChat.type === 'channel'
@@ -1685,19 +1959,9 @@ export default function App() {
 
             {/* Messages Area */}
             <div className="flex-1 overflow-y-auto px-4 sm:px-8 py-5 space-y-2.5 select-text">
-              <div className="flex justify-center mb-4">
-                <div className="px-3.5 py-1.5 rounded-full bg-[#182533]/90 text-xs text-slate-300 flex items-center gap-1.5 shadow-sm">
-                  <Lock className="w-3.5 h-3.5 text-emerald-400 shrink-0" />
-                  <span>
-                    Сквозное шифрование (AES-256-GCM) активно · Ключ:{' '}
-                    {activeChat.e2eeFingerprint.slice(0, 14)}
-                  </span>
-                </div>
-              </div>
-
               {activeChatMessages.length === 0 && (
                 <div className="text-center py-12 text-xs text-slate-400">
-                  Сообщений пока нет. Напишите первое зашифрованное сообщение ниже.
+                  Сообщений пока нет. Напишите сообщение или запишите голосовое ниже.
                 </div>
               )}
 
@@ -1769,36 +2033,49 @@ export default function App() {
                           <div>CIPHER: {msg.e2ee.ciphertextBase64}</div>
                         </div>
                       ) : (
-                        <p className="text-[14.5px] leading-snug whitespace-pre-wrap break-words">
-                          {displayText}
-                        </p>
+                        !(
+                          (msg.attachment?.isVoiceMessage ||
+                            msg.attachment?.mimeType?.startsWith('audio/')) &&
+                          displayText === 'Голосовое сообщение'
+                        ) && (
+                          <p className="text-[14.5px] leading-snug whitespace-pre-wrap break-words">
+                            {displayText}
+                          </p>
+                        )
                       )}
 
-                      {msg.attachment && (
-                        <div className="mt-2 p-2.5 rounded-xl bg-black/20 flex items-center justify-between gap-3">
-                          <div className="flex items-center gap-2.5 min-w-0">
-                            <div className="w-9 h-9 rounded-full bg-sky-500/20 text-sky-300 flex items-center justify-center shrink-0">
-                              <FileText className="w-4 h-4" />
-                            </div>
-                            <div className="min-w-0">
-                              <div className="text-xs font-semibold text-white truncate">
-                                {msg.attachment.name}
+                      {msg.attachment &&
+                        (msg.attachment.isVoiceMessage ||
+                        msg.attachment.mimeType?.startsWith('audio/') ? (
+                          <VoiceMessagePlayer
+                            attachment={msg.attachment}
+                            isOwn={isOwn}
+                          />
+                        ) : (
+                          <div className="mt-2 p-2.5 rounded-xl bg-black/20 flex items-center justify-between gap-3">
+                            <div className="flex items-center gap-2.5 min-w-0">
+                              <div className="w-9 h-9 rounded-full bg-sky-500/20 text-sky-300 flex items-center justify-center shrink-0">
+                                <FileText className="w-4 h-4" />
                               </div>
-                              <div className="text-[11px] text-slate-300">
-                                Зашифровано E2EE
+                              <div className="min-w-0">
+                                <div className="text-xs font-semibold text-white truncate">
+                                  {msg.attachment.name}
+                                </div>
+                                <div className="text-[11px] text-slate-300">
+                                  {formatFileSize(msg.attachment.size)}
+                                </div>
                               </div>
                             </div>
+                            <a
+                              href={msg.attachment.dataUrl}
+                              download={msg.attachment.name}
+                              className="p-2 rounded-full bg-sky-500 hover:bg-sky-400 text-white shrink-0"
+                              title="Скачать"
+                            >
+                              <Download className="w-3.5 h-3.5" />
+                            </a>
                           </div>
-                          <a
-                            href={msg.attachment.dataUrl}
-                            download={msg.attachment.name}
-                            className="p-2 rounded-full bg-sky-500 hover:bg-sky-400 text-white shrink-0"
-                            title="Скачать"
-                          >
-                            <Download className="w-3.5 h-3.5" />
-                          </a>
-                        </div>
-                      )}
+                        ))}
 
                       <div className="mt-1 flex items-center justify-end gap-2 text-[11px] text-slate-300/80 select-none">
                         <div className="flex items-center gap-1 mr-auto">
@@ -1914,67 +2191,134 @@ export default function App() {
                 </div>
               )}
 
-              <form
-                onSubmit={handleSendMessage}
-                className="flex items-center gap-2"
-              >
-                <input
-                  ref={fileInputRef}
-                  type="file"
-                  onChange={handleFileUpload}
-                  className="hidden"
-                />
-                <button
-                  type="button"
-                  onClick={() => fileInputRef.current?.click()}
-                  className="p-2.5 rounded-full hover:bg-[#242F3D] text-slate-400 hover:text-white transition-colors shrink-0"
-                  title="Прикрепить файл"
-                >
-                  <Paperclip className="w-5 h-5" />
-                </button>
+              {voiceError && (
+                <div className="mb-2 px-3.5 py-2 rounded-xl bg-red-950/60 border border-red-500/40 flex items-center justify-between text-xs text-red-200">
+                  <span>{voiceError}</span>
+                  <button
+                    type="button"
+                    onClick={() => setVoiceError(null)}
+                    className="p-1 text-red-300 hover:text-white"
+                  >
+                    <X className="w-3.5 h-3.5" />
+                  </button>
+                </div>
+              )}
 
-                <button
-                  type="button"
-                  onClick={() => setShowEmojiPicker(!showEmojiPicker)}
-                  className="p-2.5 rounded-full hover:bg-[#242F3D] text-slate-400 hover:text-white transition-colors shrink-0"
-                  title="Смайлы"
-                >
-                  <Smile className="w-5 h-5" />
-                </button>
+              {isRecordingVoice ? (
+                <div className="flex items-center gap-3 px-3 py-1.5 rounded-full bg-[#242F3D] border border-red-500/40">
+                  <button
+                    type="button"
+                    onClick={cancelVoiceRecording}
+                    className="p-2 rounded-full hover:bg-red-500/20 text-slate-300 hover:text-red-300 transition-colors shrink-0"
+                    title="Отменить запись"
+                  >
+                    <Trash2 className="w-4 h-4" />
+                  </button>
 
-                <input
-                  type="text"
-                  value={draftText}
-                  onChange={(e) => setDraftText(e.target.value)}
-                  placeholder={
-                    activeChat.type === 'channel'
-                      ? `Написать публикацию в «${activeChat.title}»...`
-                      : 'Написать сообщение...'
-                  }
-                  className="flex-1 px-4 py-2.5 rounded-full bg-[#242F3D] text-sm text-white placeholder-slate-400 focus:outline-none focus:ring-1 focus:ring-sky-500"
-                />
+                  <div className="flex items-center gap-2 shrink-0">
+                    <span className="w-2.5 h-2.5 rounded-full bg-red-500 animate-pulse" />
+                    <span className="text-xs font-semibold text-white tabular-nums">
+                      {formatRecordingTimer(recordingSeconds)}
+                    </span>
+                  </div>
 
-                <button
-                  type="submit"
-                  className="w-10 h-10 rounded-full bg-sky-500 hover:bg-sky-400 text-white flex items-center justify-center transition-colors shrink-0 shadow-md shadow-sky-500/20"
-                  title="Отправить"
+                  <div className="flex-1 flex items-center gap-1 h-6 overflow-hidden px-2">
+                    {liveWaveform.map((bar, idx) => (
+                      <span
+                        key={idx}
+                        style={{
+                          height: `${Math.max(4, Math.round(bar * 22))}px`,
+                        }}
+                        className="flex-1 min-w-[3px] rounded-full bg-sky-400 transition-all duration-75"
+                      />
+                    ))}
+                  </div>
+
+                  <span className="hidden sm:inline text-xs text-slate-400">
+                    Запись голосового...
+                  </span>
+
+                  <button
+                    type="button"
+                    onClick={finishAndSendVoiceRecording}
+                    className="w-9 h-9 rounded-full bg-sky-500 hover:bg-sky-400 text-white flex items-center justify-center transition-colors shrink-0 shadow-md shadow-sky-500/20"
+                    title="Остановить и отправить голосовое сообщение"
+                  >
+                    <Send className="w-4 h-4" />
+                  </button>
+                </div>
+              ) : (
+                <form
+                  onSubmit={handleSendMessage}
+                  className="flex items-center gap-2"
                 >
-                  <Send className="w-4 h-4" />
-                </button>
-              </form>
+                  <input
+                    ref={fileInputRef}
+                    type="file"
+                    onChange={handleFileUpload}
+                    className="hidden"
+                  />
+                  <button
+                    type="button"
+                    onClick={() => fileInputRef.current?.click()}
+                    className="p-2.5 rounded-full hover:bg-[#242F3D] text-slate-400 hover:text-white transition-colors shrink-0"
+                    title="Прикрепить файл"
+                  >
+                    <Paperclip className="w-5 h-5" />
+                  </button>
+
+                  <button
+                    type="button"
+                    onClick={() => setShowEmojiPicker(!showEmojiPicker)}
+                    className="p-2.5 rounded-full hover:bg-[#242F3D] text-slate-400 hover:text-white transition-colors shrink-0"
+                    title="Смайлы"
+                  >
+                    <Smile className="w-5 h-5" />
+                  </button>
+
+                  <input
+                    type="text"
+                    value={draftText}
+                    onChange={(e) => setDraftText(e.target.value)}
+                    placeholder={
+                      activeChat.type === 'channel'
+                        ? `Написать публикацию в «${activeChat.title}»...`
+                        : 'Сообщение...'
+                    }
+                    className="flex-1 px-4 py-2.5 rounded-full bg-[#242F3D] text-sm text-white placeholder-slate-400 focus:outline-none focus:ring-1 focus:ring-sky-500"
+                  />
+
+                  <button
+                    type="button"
+                    onClick={startVoiceRecording}
+                    className="w-10 h-10 rounded-full bg-[#242F3D] hover:bg-slate-700 text-slate-200 hover:text-white flex items-center justify-center transition-colors shrink-0"
+                    title="Записать голосовое сообщение"
+                  >
+                    <Mic className="w-4 h-4" />
+                  </button>
+
+                  <button
+                    type="submit"
+                    className="w-10 h-10 rounded-full bg-sky-500 hover:bg-sky-400 text-white flex items-center justify-center transition-colors shrink-0 shadow-md shadow-sky-500/20"
+                    title="Отправить"
+                  >
+                    <Send className="w-4 h-4" />
+                  </button>
+                </form>
+              )}
             </div>
           </main>
         ) : (
           <main className="flex-1 flex flex-col items-center justify-center p-8 bg-[#0E1621] text-center">
             <div className="max-w-md flex flex-col items-center gap-4">
               <div className="w-16 h-16 rounded-full bg-[#17212B] border border-slate-800 flex items-center justify-center text-sky-400">
-                <Shield className="w-8 h-8" />
+                <MessageSquarePlus className="w-8 h-8" />
               </div>
               <h2 className="text-lg font-bold text-white">
                 Выберите чат или создайте новый
               </h2>
               <p className="text-xs text-slate-400 leading-relaxed">
-                В ClickChat нет предустановленных демо-аккаунтов или фейковых каналов. Все создаваемые вами диалоги, группы, каналы и боты сохраняются в вашей базе данных PostgreSQL.
+                Выберите диалог в списке слева или создайте новый личный чат, группу или канал.
               </p>
               <div className="flex flex-wrap items-center justify-center gap-2.5 mt-2">
                 <button

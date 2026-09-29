@@ -104,10 +104,10 @@ export const ProfileSyncModal: React.FC<ProfileSyncModalProps> = ({
             <Shield className="w-5 h-5 text-emerald-400" />
             <div>
               <h2 className="text-base font-semibold text-slate-100">
-                Аккаунт, Ключи E2EE и Синхронизация устройств
+                Профиль и активные устройства
               </h2>
               <p className="text-xs text-slate-400">
-                {userEmail ? `Авторизован как ${userEmail}` : 'Управление криптографическим профилем и сессиями'}
+                {userEmail ? userEmail : 'Настройки аккаунта и сессий'}
               </p>
             </div>
           </div>
@@ -139,7 +139,7 @@ export const ProfileSyncModal: React.FC<ProfileSyncModalProps> = ({
                 : 'text-slate-400 hover:text-slate-200 bg-slate-900'
             }`}
           >
-            Мой аккаунт и Ключи E2EE
+            Профиль
           </button>
           <button
             onClick={() => setActiveTab('sync')}
@@ -149,7 +149,7 @@ export const ProfileSyncModal: React.FC<ProfileSyncModalProps> = ({
                 : 'text-slate-400 hover:text-slate-200 bg-slate-900'
             }`}
           >
-            Синхронизация устройств ({userDevices.length})
+            Устройства ({userDevices.length})
           </button>
         </div>
 
@@ -185,7 +185,7 @@ export const ProfileSyncModal: React.FC<ProfileSyncModalProps> = ({
 
                 <div>
                   <label className="block text-xs text-slate-400 mb-1">
-                    О себе / статус безопасности
+                    О себе
                   </label>
                   <input
                     type="text"
@@ -200,11 +200,11 @@ export const ProfileSyncModal: React.FC<ProfileSyncModalProps> = ({
                     type="submit"
                     className="px-4 py-2 rounded-lg bg-emerald-500 hover:bg-emerald-400 text-slate-950 text-xs font-semibold transition-colors"
                   >
-                    Сохранить в аккаунте
+                    Сохранить
                   </button>
                   {savedNotice && (
                     <span className="text-xs text-emerald-400">
-                      Профиль сохранен и синхронизирован между всеми вашими устройствами!
+                      Изменения сохранены
                     </span>
                   )}
                 </div>

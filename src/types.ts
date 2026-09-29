@@ -32,6 +32,9 @@ export interface FileAttachment {
   encrypted: boolean;
   ivHex: string;
   sha256Hex: string;
+  isVoiceMessage?: boolean;
+  durationSeconds?: number;
+  waveform?: number[];
 }
 
 export interface E2EEEnvelope {
