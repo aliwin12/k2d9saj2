@@ -512,6 +512,43 @@ export default function App() {
     setAuthError(null);
     setSubmittingAuth(true);
     try {
+      // First try the user's own Firebase project (clickchatweb)
+      try {
+        if (authMode === 'register') {
+          const cred = await createUserWithEmailAndPassword(
+            auth,
+            emailInput.trim(),
+            passwordInput
+          );
+          if (nameInput.trim()) {
+            await updateProfile(cred.user, { displayName: nameInput.trim() });
+          }
+        } else {
+          await signInWithEmailAndPassword(
+            auth,
+            emailInput.trim(),
+            passwordInput
+          );
+        }
+        if (getBrowserNotificationPermission() === 'default') {
+          requestBrowserNotificationPermission().then((status) =>
+            setNotificationPermission(status)
+          );
+        }
+        return;
+      } catch (fbErr: any) {
+        const fbCode = String(fbErr?.code || '');
+        if (
+          fbCode.includes('wrong-password') ||
+          fbCode.includes('invalid-credential') ||
+          fbCode.includes('email-already-in-use') ||
+          fbCode.includes('weak-password')
+        ) {
+          throw fbErr;
+        }
+        // If domain or provider isn't enabled yet in Firebase Console, fall through to direct ClickChat server auth
+      }
+
       const res = await fetch('/api/auth/account', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
@@ -548,7 +585,7 @@ export default function App() {
       }
     } catch (error: any) {
       setAuthError(
-        error?.message || 'Не удалось связаться с сервером авторизации.'
+        error?.message || 'Не удалось выполнить вход. Проверьте Email и пароль.'
       );
     } finally {
       setSubmittingAuth(false);
