@@ -121,6 +121,8 @@ export interface CallState {
   mode: 'audio' | 'video' | 'screen';
   initiatorId: string;
   initiatorName: string;
+  direction?: 'outgoing' | 'incoming';
+  ringingStartedAt?: number;
   status: 'ringing' | 'connected' | 'ended';
   startedAt?: number;
   isMuted: boolean;

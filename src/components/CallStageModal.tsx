@@ -5,8 +5,10 @@ import {
   Video,
   VideoOff,
   Monitor,
+  Phone,
   PhoneOff,
-  Lock,
+  PhoneIncoming,
+  PhoneOutgoing,
   Volume2,
   Maximize2,
   Minimize2,
@@ -23,6 +25,8 @@ interface CallStageModalProps {
   incomingSignal: any | null;
 }
 
+const CALL_RING_TIMEOUT_SECONDS = 30;
+
 export const CallStageModal: React.FC<CallStageModalProps> = ({
   call,
   chat,
@@ -38,24 +42,88 @@ export const CallStageModal: React.FC<CallStageModalProps> = ({
   const peerRef = useRef<RTCPeerConnection | null>(null);
   const localStreamRef = useRef<MediaStream | null>(null);
   const screenStreamRef = useRef<MediaStream | null>(null);
+  const ringtoneAudioRef = useRef<HTMLAudioElement | null>(null);
 
   const [elapsedSec, setElapsedSec] = useState(0);
+  const [ringRemainingSec, setRingRemainingSec] = useState(
+    CALL_RING_TIMEOUT_SECONDS
+  );
   const [audioLevel, setAudioLevel] = useState(18);
   const [mediaNotice, setMediaNotice] = useState<string | null>(null);
   const [expanded, setExpanded] = useState(false);
   const [usingSyntheticScreen, setUsingSyntheticScreen] = useState(false);
 
-  // Call duration timer
+  const isOutgoing =
+    call.direction === 'outgoing' || call.initiatorId === currentUser.id;
+  const isRinging = call.status === 'ringing';
+
+  // Play /call.mp3 (outgoing) or /incomingcall.mp3 (incoming) while ringing, and enforce 30s timeout
   useEffect(() => {
+    if (!isRinging) {
+      if (ringtoneAudioRef.current) {
+        ringtoneAudioRef.current.pause();
+        ringtoneAudioRef.current.currentTime = 0;
+        ringtoneAudioRef.current = null;
+      }
+      return;
+    }
+
+    const soundSrc = isOutgoing ? '/call.mp3' : '/incomingcall.mp3';
+    const audio = new Audio(soundSrc);
+    audio.loop = true;
+    audio.volume = 0.85;
+    ringtoneAudioRef.current = audio;
+
+    audio.play().catch(() => {
+      // Browser may require interaction before playing audio
+    });
+
+    const ringStart = call.ringingStartedAt || Date.now();
+    const timer = setInterval(() => {
+      const passed = Math.floor((Date.now() - ringStart) / 1000);
+      const left = Math.max(0, CALL_RING_TIMEOUT_SECONDS - passed);
+      setRingRemainingSec(left);
+
+      if (passed >= CALL_RING_TIMEOUT_SECONDS) {
+        clearInterval(timer);
+        audio.pause();
+        sendSignal({
+          type: 'call-timeout',
+          callId: call.callId,
+          chatId: call.chatId,
+          senderId: currentUser.id,
+        });
+        onEndCall();
+      }
+    }, 250);
+
+    return () => {
+      clearInterval(timer);
+      audio.pause();
+      audio.currentTime = 0;
+      if (ringtoneAudioRef.current === audio) {
+        ringtoneAudioRef.current = null;
+      }
+    };
+  }, [isRinging, isOutgoing, call.callId]);
+
+  // Connected call duration timer
+  useEffect(() => {
+    if (call.status !== 'connected') {
+      setElapsedSec(0);
+      return;
+    }
     const start = call.startedAt || Date.now();
     const timer = setInterval(() => {
       setElapsedSec(Math.floor((Date.now() - start) / 1000));
     }, 1000);
     return () => clearInterval(timer);
-  }, [call.startedAt]);
+  }, [call.status, call.startedAt]);
 
-  // Initialize local media + WebRTC PeerConnection
+  // Initialize local media + WebRTC PeerConnection ONLY after call is accepted ('connected')
   useEffect(() => {
+    if (call.status !== 'connected') return;
+
     let mounted = true;
     let audioCtx: AudioContext | null = null;
     let animId: number | null = null;
@@ -104,7 +172,6 @@ export const CallStageModal: React.FC<CallStageModalProps> = ({
           }
           stream.getTracks().forEach((track) => pc.addTrack(track, stream));
 
-          // Real-time Web Audio microphone level meter
           try {
             audioCtx = new AudioContext();
             const source = audioCtx.createMediaStreamSource(stream);
@@ -125,25 +192,24 @@ export const CallStageModal: React.FC<CallStageModalProps> = ({
           }
         }
 
-        // Create WebRTC offer so any other connected tab/device in this chat can answer
-        const offer = await pc.createOffer();
-        await pc.setLocalDescription(offer);
-        sendSignal({
-          type: 'offer',
-          callId: call.callId,
-          chatId: call.chatId,
-          senderId: currentUser.id,
-          senderName: currentUser.displayName,
-          mode: call.mode,
-          sdp: offer,
-        });
-        onUpdateCall({ status: 'connected' });
+        if (isOutgoing) {
+          const offer = await pc.createOffer();
+          await pc.setLocalDescription(offer);
+          sendSignal({
+            type: 'offer',
+            callId: call.callId,
+            chatId: call.chatId,
+            senderId: currentUser.id,
+            senderName: currentUser.displayName,
+            mode: call.mode,
+            sdp: offer,
+          });
+        }
       } catch {
         if (!mounted) return;
         setMediaNotice(
-          'Аппаратная камера/микрофон недоступны в песочнице — активирован защищенный программный медиа-поток E2EE.'
+          'Камера или микрофон недоступны — звонок продолжается в голосовом режиме.'
         );
-        onUpdateCall({ status: 'connected' });
       }
     }
 
@@ -163,18 +229,49 @@ export const CallStageModal: React.FC<CallStageModalProps> = ({
         peerRef.current.close();
       }
     };
-  }, []);
+  }, [call.status]);
 
-  // Handle incoming WebRTC signals from other tabs/devices
+  // Handle incoming call & WebRTC signals from other tabs/devices
   useEffect(() => {
     if (!incomingSignal || incomingSignal.senderId === currentUser.id) return;
+
+    if (
+      incomingSignal.type === 'call-accept' &&
+      incomingSignal.chatId === call.chatId
+    ) {
+      if (ringtoneAudioRef.current) {
+        ringtoneAudioRef.current.pause();
+      }
+      onUpdateCall({
+        status: 'connected',
+        remotePeerConnected: true,
+        startedAt: Date.now(),
+      });
+      return;
+    }
+
+    if (
+      (incomingSignal.type === 'call-reject' ||
+        incomingSignal.type === 'call-end' ||
+        incomingSignal.type === 'call-timeout') &&
+      incomingSignal.chatId === call.chatId
+    ) {
+      if (ringtoneAudioRef.current) {
+        ringtoneAudioRef.current.pause();
+      }
+      onEndCall();
+      return;
+    }
+
     const pc = peerRef.current;
     if (!pc) return;
 
     async function handleSignal() {
       try {
         if (incomingSignal.type === 'offer' && incomingSignal.sdp) {
-          await pc!.setRemoteDescription(new RTCSessionDescription(incomingSignal.sdp));
+          await pc!.setRemoteDescription(
+            new RTCSessionDescription(incomingSignal.sdp)
+          );
           const answer = await pc!.createAnswer();
           await pc!.setLocalDescription(answer);
           sendSignal({
@@ -186,10 +283,17 @@ export const CallStageModal: React.FC<CallStageModalProps> = ({
           });
           onUpdateCall({ remotePeerConnected: true, status: 'connected' });
         } else if (incomingSignal.type === 'answer' && incomingSignal.sdp) {
-          await pc!.setRemoteDescription(new RTCSessionDescription(incomingSignal.sdp));
+          await pc!.setRemoteDescription(
+            new RTCSessionDescription(incomingSignal.sdp)
+          );
           onUpdateCall({ remotePeerConnected: true, status: 'connected' });
-        } else if (incomingSignal.type === 'ice-candidate' && incomingSignal.candidate) {
-          await pc!.addIceCandidate(new RTCIceCandidate(incomingSignal.candidate));
+        } else if (
+          incomingSignal.type === 'ice-candidate' &&
+          incomingSignal.candidate
+        ) {
+          await pc!.addIceCandidate(
+            new RTCIceCandidate(incomingSignal.candidate)
+          );
         }
       } catch (e) {
         console.error('WebRTC signal error:', e);
@@ -199,7 +303,7 @@ export const CallStageModal: React.FC<CallStageModalProps> = ({
     handleSignal();
   }, [incomingSignal]);
 
-  // Synthetic interactive screen share canvas fallback when browser blocks getDisplayMedia inside iframe
+  // Synthetic screen share fallback when browser blocks getDisplayMedia inside iframe
   useEffect(() => {
     if (!usingSyntheticScreen || !screenCanvasRef.current) return;
     const canvas = screenCanvasRef.current;
@@ -213,7 +317,6 @@ export const CallStageModal: React.FC<CallStageModalProps> = ({
       ctx.fillStyle = '#0B0F17';
       ctx.fillRect(0, 0, canvas.width, canvas.height);
 
-      // Grid lines
       ctx.strokeStyle = 'rgba(148, 163, 184, 0.08)';
       ctx.lineWidth = 1;
       for (let x = 0; x < canvas.width; x += 40) {
@@ -229,38 +332,28 @@ export const CallStageModal: React.FC<CallStageModalProps> = ({
         ctx.stroke();
       }
 
-      // Simulated shared window header
       ctx.fillStyle = '#1E293B';
       ctx.fillRect(36, 28, canvas.width - 72, 32);
-      ctx.fillStyle = '#10B981';
-      ctx.font = '600 12px "JetBrains Mono", monospace';
+      ctx.fillStyle = '#38BDF8';
+      ctx.font = '600 12px Inter, sans-serif';
       ctx.fillText(
-        `CLICKCHAT SCREEN STREAM · AES-256-GCM · FRAME #${String(frame).padStart(5, '0')}`,
+        `Демонстрация экрана · ${chat?.title || 'ClickChat'}`,
         52,
         48
       );
 
-      // Simulated live terminal / architecture diagram on shared screen
       ctx.fillStyle = '#0F172A';
       ctx.fillRect(36, 60, canvas.width - 72, canvas.height - 92);
 
       ctx.fillStyle = '#E2E8F0';
-      ctx.font = '500 13px "JetBrains Mono", monospace';
-      ctx.fillText('$ clickchat-node --verify-e2ee --stream=webrtc-dtls-srtp', 56, 96);
+      ctx.font = '500 13px Inter, sans-serif';
+      ctx.fillText(`Трансляция экрана: ${currentUser.displayName}`, 56, 102);
       ctx.fillStyle = '#94A3B8';
-      ctx.fillText(`> Room: ${chat?.title || 'ClickChat Session'}`, 56, 122);
-      ctx.fillText(`> E2EE Fingerprint: ${chat?.e2eeFingerprint || 'AF92 401C 88B1'}`, 56, 146);
-      ctx.fillStyle = '#34D399';
-      ctx.fillText(
-        `> Демонстрация экрана активна · 60 FPS · Поток зашифрован ключом сессии`,
-        56,
-        172
-      );
+      ctx.fillText(`Чат: ${chat?.title || 'ClickChat'}`, 56, 130);
 
-      // Animated waveform bars
       for (let i = 0; i < 24; i++) {
         const h = 18 + Math.sin(frame * 0.08 + i * 0.5) * 14;
-        ctx.fillStyle = i % 3 === 0 ? '#10B981' : '#334155';
+        ctx.fillStyle = i % 3 === 0 ? '#38BDF8' : '#334155';
         ctx.fillRect(56 + i * 18, 225 - h, 12, h);
       }
 
@@ -283,21 +376,53 @@ export const CallStageModal: React.FC<CallStageModalProps> = ({
       }
       const pc = existingPc || peerRef.current;
       if (pc) {
-        displayStream.getTracks().forEach((track) => pc.addTrack(track, displayStream));
+        displayStream
+          .getTracks()
+          .forEach((track) => pc.addTrack(track, displayStream));
       }
       displayStream.getVideoTracks()[0].onended = () => {
         onUpdateCall({ isScreenSharing: false });
       };
       onUpdateCall({ isScreenSharing: true, isCameraOn: false });
     } catch {
-      // In iframe sandboxes where getDisplayMedia may be restricted, provide live canvas stream
       setUsingSyntheticScreen(true);
       onUpdateCall({ isScreenSharing: true, isCameraOn: false });
-      setMediaNotice(
-        'Включена демонстрация рабочего пространства ClickChat (защищенный поток Canvas WebRTC).'
-      );
+      setMediaNotice('Включена демонстрация окна приложения.');
     }
   }
+
+  const handleAcceptIncomingCall = () => {
+    if (ringtoneAudioRef.current) {
+      ringtoneAudioRef.current.pause();
+    }
+    const now = Date.now();
+    onUpdateCall({
+      status: 'connected',
+      remotePeerConnected: true,
+      startedAt: now,
+    });
+    sendSignal({
+      type: 'call-accept',
+      callId: call.callId,
+      chatId: call.chatId,
+      senderId: currentUser.id,
+      senderName: currentUser.displayName,
+    });
+  };
+
+  const handleRejectOrCancelCall = () => {
+    if (ringtoneAudioRef.current) {
+      ringtoneAudioRef.current.pause();
+    }
+    sendSignal({
+      type: isRinging ? 'call-reject' : 'call-end',
+      callId: call.callId,
+      chatId: call.chatId,
+      senderId: currentUser.id,
+      senderName: currentUser.displayName,
+    });
+    onEndCall();
+  };
 
   const toggleMute = () => {
     const nextMuted = !call.isMuted;
@@ -322,10 +447,18 @@ export const CallStageModal: React.FC<CallStageModalProps> = ({
         if (localVideoRef.current) {
           localVideoRef.current.srcObject = stream;
         }
-        onUpdateCall({ isCameraOn: true, isScreenSharing: false, mode: 'video' });
+        onUpdateCall({
+          isCameraOn: true,
+          isScreenSharing: false,
+          mode: 'video',
+        });
       } catch {
         setMediaNotice('Камера недоступна в текущем окружении браузера.');
-        onUpdateCall({ isCameraOn: true, isScreenSharing: false, mode: 'video' });
+        onUpdateCall({
+          isCameraOn: true,
+          isScreenSharing: false,
+          mode: 'video',
+        });
       }
     } else {
       if (localStreamRef.current) {
@@ -355,6 +488,79 @@ export const CallStageModal: React.FC<CallStageModalProps> = ({
     return `${m}:${s}`;
   };
 
+  // RENDER RINGING SCREEN (Outgoing or Incoming — rings for 30 seconds until accepted)
+  if (isRinging) {
+    const targetTitle = isOutgoing
+      ? chat?.title || 'Собеседник'
+      : call.initiatorName || chat?.title || 'Собеседник';
+
+    return (
+      <div className="fixed inset-0 z-50 bg-black/85 backdrop-blur-md flex items-center justify-center p-4">
+        <div className="bg-[#17212B] border border-slate-800 rounded-3xl w-full max-w-md p-8 flex flex-col items-center text-center shadow-2xl">
+          <div className="relative mb-6">
+            <span className="absolute -inset-4 rounded-full bg-sky-500/20 animate-ping" />
+            <span className="absolute -inset-2 rounded-full bg-sky-500/30 animate-pulse" />
+            <div className="relative w-24 h-24 rounded-full bg-gradient-to-br from-sky-500 to-blue-600 flex items-center justify-center text-2xl font-bold text-white shadow-lg">
+              {targetTitle.slice(0, 2).toUpperCase()}
+            </div>
+          </div>
+
+          <div className="inline-flex items-center gap-1.5 px-3 py-1 rounded-full bg-sky-500/15 text-sky-400 text-xs font-medium mb-2">
+            {isOutgoing ? (
+              <>
+                <PhoneOutgoing className="w-3.5 h-3.5" />
+                <span>Исходящий звонок</span>
+              </>
+            ) : (
+              <>
+                <PhoneIncoming className="w-3.5 h-3.5" />
+                <span>Входящий звонок</span>
+              </>
+            )}
+          </div>
+
+          <h2 className="text-xl font-bold text-white">{targetTitle}</h2>
+
+          <p className="text-sm text-slate-300 mt-1">
+            {isOutgoing
+              ? 'Звоним собеседнику... Ожидание ответа'
+              : `${call.initiatorName || 'Собеседник'} вызывает вас (${
+                  call.mode === 'video' ? 'Видеозвонок' : 'Аудиозвонок'
+                })`}
+          </p>
+
+          <div className="mt-4 px-3.5 py-1.5 rounded-full bg-[#0E1621] border border-slate-800 text-xs text-slate-400 tabular-nums">
+            Автоотмена через{' '}
+            <span className="text-white font-semibold">{ringRemainingSec}</span>{' '}
+            сек.
+          </div>
+
+          <div className="mt-8 flex items-center justify-center gap-6 w-full">
+            {!isOutgoing && (
+              <button
+                type="button"
+                onClick={handleAcceptIncomingCall}
+                className="flex-1 py-3.5 px-5 rounded-2xl bg-emerald-500 hover:bg-emerald-400 text-slate-950 font-semibold text-sm flex items-center justify-center gap-2 shadow-lg shadow-emerald-500/25 transition-colors"
+              >
+                <Phone className="w-4 h-4" />
+                <span>Принять</span>
+              </button>
+            )}
+
+            <button
+              type="button"
+              onClick={handleRejectOrCancelCall}
+              className="flex-1 py-3.5 px-5 rounded-2xl bg-red-600 hover:bg-red-500 text-white font-semibold text-sm flex items-center justify-center gap-2 shadow-lg shadow-red-600/25 transition-colors"
+            >
+              <PhoneOff className="w-4 h-4" />
+              <span>{isOutgoing ? 'Отменить вызов' : 'Отклонить'}</span>
+            </button>
+          </div>
+        </div>
+      </div>
+    );
+  }
+
   return (
     <div className="fixed inset-0 z-50 bg-black/80 backdrop-blur-sm flex items-center justify-center p-4">
       <div
@@ -365,18 +571,14 @@ export const CallStageModal: React.FC<CallStageModalProps> = ({
         {/* Call Top Bar */}
         <div className="flex items-center justify-between px-5 py-3.5 border-b border-slate-800/80 bg-[#111827]">
           <div className="flex items-center gap-3 min-w-0">
-            <Lock className="w-4 h-4 text-emerald-400 shrink-0" />
+            <Phone className="w-4 h-4 text-emerald-400 shrink-0" />
             <div className="truncate">
               <span className="text-sm font-semibold text-slate-100">
-                {chat?.title || 'Защищенный звонок ClickChat'}
+                {chat?.title || 'Звонок ClickChat'}
               </span>
               <span className="mx-2 text-slate-600">·</span>
               <span className="text-xs font-mono tabular-nums text-emerald-400">
                 {formatDuration(elapsedSec)}
-              </span>
-              <span className="mx-2 text-slate-600">·</span>
-              <span className="text-xs text-slate-400 font-mono">
-                SAS: {call.encryptionSAS}
               </span>
             </div>
           </div>
@@ -386,7 +588,11 @@ export const CallStageModal: React.FC<CallStageModalProps> = ({
             className="p-1.5 text-slate-400 hover:text-slate-200 rounded-lg hover:bg-slate-800 transition-colors"
             title={expanded ? 'Свернуть окно' : 'Развернуть окно'}
           >
-            {expanded ? <Minimize2 className="w-4 h-4" /> : <Maximize2 className="w-4 h-4" />}
+            {expanded ? (
+              <Minimize2 className="w-4 h-4" />
+            ) : (
+              <Maximize2 className="w-4 h-4" />
+            )}
           </button>
         </div>
 
@@ -411,43 +617,47 @@ export const CallStageModal: React.FC<CallStageModalProps> = ({
               />
             ) : null}
 
-            {!call.isCameraOn && !call.isScreenSharing && !usingSyntheticScreen && (
-              <div className="flex flex-col items-center gap-3 p-6 text-center">
-                <div className="w-16 h-16 rounded-xl bg-slate-800 border border-slate-700 flex items-center justify-center text-lg font-semibold text-emerald-400">
-                  {currentUser.displayName.slice(0, 2).toUpperCase()}
+            {!call.isCameraOn &&
+              !call.isScreenSharing &&
+              !usingSyntheticScreen && (
+                <div className="flex flex-col items-center gap-3 p-6 text-center">
+                  <div className="w-16 h-16 rounded-xl bg-slate-800 border border-slate-700 flex items-center justify-center text-lg font-semibold text-sky-400">
+                    {currentUser.displayName.slice(0, 2).toUpperCase()}
+                  </div>
+                  <div>
+                    <p className="text-sm font-medium text-slate-100">
+                      {currentUser.displayName} (Вы)
+                    </p>
+                    <p className="text-xs text-slate-400 mt-0.5">
+                      {call.isMuted ? 'Микрофон отключен' : 'Микрофон включен'}
+                    </p>
+                  </div>
+                  <div className="flex items-end gap-1 h-6 mt-1">
+                    {[0.5, 0.9, 1.2, 0.7, 1.1, 0.8, 0.4].map((mult, idx) => (
+                      <span
+                        key={idx}
+                        className="w-1.5 bg-sky-400 rounded-sm transition-all duration-150"
+                        style={{
+                          height: call.isMuted
+                            ? '4px'
+                            : `${Math.min(
+                                24,
+                                Math.max(4, Math.round((audioLevel / 4) * mult))
+                              )}px`,
+                        }}
+                      />
+                    ))}
+                  </div>
                 </div>
-                <div>
-                  <p className="text-sm font-medium text-slate-100">
-                    {currentUser.displayName} (Вы)
-                  </p>
-                  <p className="text-xs text-slate-400 mt-0.5">
-                    {call.isMuted ? 'Микрофон отключен' : 'Аудио-канал AES-256-GCM активен'}
-                  </p>
-                </div>
-                {/* Audio spectrum bars */}
-                <div className="flex items-end gap-1 h-6 mt-1">
-                  {[0.5, 0.9, 1.2, 0.7, 1.1, 0.8, 0.4].map((mult, idx) => (
-                    <span
-                      key={idx}
-                      className="w-1.5 bg-emerald-500/80 rounded-sm transition-all duration-150"
-                      style={{
-                        height: call.isMuted
-                          ? '4px'
-                          : `${Math.min(24, Math.max(4, Math.round((audioLevel / 4) * mult)))}px`,
-                      }}
-                    />
-                  ))}
-                </div>
-              </div>
-            )}
+              )}
 
             <div className="absolute bottom-3 left-3 text-xs text-slate-300 bg-black/65 px-2.5 py-1 rounded">
               {currentUser.displayName} ·{' '}
               {call.isScreenSharing
                 ? 'Демонстрация экрана'
                 : call.isCameraOn
-                ? 'HD Камера'
-                : 'Голосовой поток'}
+                ? 'Камера'
+                : 'Аудио'}
             </div>
           </div>
 
@@ -469,21 +679,18 @@ export const CallStageModal: React.FC<CallStageModalProps> = ({
                 </div>
                 <div>
                   <p className="text-sm font-medium text-slate-100">
-                    {chat?.title || 'Участник комнаты'}
+                    {chat?.title || 'Собеседник'}
                   </p>
                   <p className="text-xs text-emerald-400 mt-0.5 flex items-center justify-center gap-1.5">
                     <Volume2 className="w-3.5 h-3.5" />
-                    Защищенный WebRTC-канал установлен
+                    На связи
                   </p>
                 </div>
-                <p className="text-xs text-slate-400 max-w-xs">
-                  Откройте ClickChat во второй вкладке или на другом устройстве, чтобы протестировать двусторонний P2P видеопоток.
-                </p>
               </div>
             )}
 
             <div className="absolute bottom-3 left-3 text-xs text-slate-300 bg-black/65 px-2.5 py-1 rounded">
-              {chat?.title} · Сквозное шифрование SRTP
+              {chat?.title || 'Собеседник'}
             </div>
           </div>
         </div>
@@ -495,12 +702,8 @@ export const CallStageModal: React.FC<CallStageModalProps> = ({
         )}
 
         {/* Call Controls Bar */}
-        <div className="flex items-center justify-between px-6 py-4 bg-[#111827] border-t border-slate-800">
-          <div className="text-xs text-slate-400 hidden sm:block">
-            Протокол: <span className="text-slate-200 font-mono">WebRTC DTLS-SRTP</span> · Ключ проверен
-          </div>
-
-          <div className="flex items-center gap-3 mx-auto sm:mx-0">
+        <div className="flex items-center justify-center px-6 py-4 bg-[#111827] border-t border-slate-800">
+          <div className="flex items-center gap-3">
             <button
               onClick={toggleMute}
               className={`px-4 py-2 rounded-lg text-xs font-medium flex items-center gap-2 transition-colors whitespace-nowrap ${
@@ -509,7 +712,11 @@ export const CallStageModal: React.FC<CallStageModalProps> = ({
                   : 'bg-slate-800 text-slate-200 hover:bg-slate-700 border border-slate-700'
               }`}
             >
-              {call.isMuted ? <MicOff className="w-4 h-4" /> : <Mic className="w-4 h-4" />}
+              {call.isMuted ? (
+                <MicOff className="w-4 h-4" />
+              ) : (
+                <Mic className="w-4 h-4" />
+              )}
               <span>{call.isMuted ? 'Включить микрофон' : 'Микрофон'}</span>
             </button>
 
@@ -521,7 +728,11 @@ export const CallStageModal: React.FC<CallStageModalProps> = ({
                   : 'bg-slate-800 text-slate-200 hover:bg-slate-700 border border-slate-700'
               }`}
             >
-              {call.isCameraOn ? <Video className="w-4 h-4" /> : <VideoOff className="w-4 h-4" />}
+              {call.isCameraOn ? (
+                <Video className="w-4 h-4" />
+              ) : (
+                <VideoOff className="w-4 h-4" />
+              )}
               <span>{call.isCameraOn ? 'Камера вкл.' : 'Видеокамера'}</span>
             </button>
 
@@ -529,16 +740,18 @@ export const CallStageModal: React.FC<CallStageModalProps> = ({
               onClick={toggleScreenShare}
               className={`px-4 py-2 rounded-lg text-xs font-medium flex items-center gap-2 transition-colors whitespace-nowrap ${
                 call.isScreenSharing
-                  ? 'bg-emerald-500 text-slate-950 font-semibold'
+                  ? 'bg-sky-500 text-slate-950 font-semibold'
                   : 'bg-slate-800 text-slate-200 hover:bg-slate-700 border border-slate-700'
               }`}
             >
               <Monitor className="w-4 h-4" />
-              <span>{call.isScreenSharing ? 'Остановить экран' : 'Демонстрация экрана'}</span>
+              <span>
+                {call.isScreenSharing ? 'Остановить экран' : 'Экран'}
+              </span>
             </button>
 
             <button
-              onClick={onEndCall}
+              onClick={handleRejectOrCancelCall}
               className="px-4 py-2 rounded-lg text-xs font-semibold bg-red-600 hover:bg-red-500 text-white flex items-center gap-2 transition-colors whitespace-nowrap"
             >
               <PhoneOff className="w-4 h-4" />
