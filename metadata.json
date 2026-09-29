@@ -1,0 +1,12 @@
+{
+  "name": "ClickChat",
+  "description": "Independent end-to-end encrypted messenger with multi-device synchronization, group chats, broadcast channels, encrypted file transfer, audio/video calls with screen sharing, and an Open Bot API.",
+  "requestFramePermissions": [
+    "camera",
+    "microphone",
+    "display-capture"
+  ],
+  "majorCapabilities": [
+    "MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"
+  ]
+}
